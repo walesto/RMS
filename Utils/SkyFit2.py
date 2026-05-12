@@ -7056,15 +7056,16 @@ class PlateTool(QtWidgets.QMainWindow):
             self.fig_photometry = plt.figure(figsize=(10, 5))  # Adjust the figure size as needed
             fig_p = self.fig_photometry
 
-            # Create a grid with 2 columns and 2 rows
-            gs = gridspec.GridSpec(2, 2, width_ratios=[1, 1], height_ratios=[1, 1])
+            # Create a grid with 2 columns and 3 rows
+            gs = gridspec.GridSpec(3, 2, width_ratios=[1, 1], height_ratios=[1, 1, 1])
 
-            # Large plot on the left
+            # Large plot on the left, spans all 3 rows
             ax_p = fig_p.add_subplot(gs[:, 0])
 
-            # Two smaller plots on the right, one on top of the other
+            # Three smaller plots on the right, stacked vertically
             ax_r = fig_p.add_subplot(gs[0, 1])
             ax_e = fig_p.add_subplot(gs[1, 1])
+            ax_m = fig_p.add_subplot(gs[2, 1])
 
             # Set photometry window title
             try:
@@ -7228,6 +7229,22 @@ class PlateTool(QtWidgets.QMainWindow):
             ax_e.set_ylabel("Fit res. (mag)")
             ax_e.set_xlabel("Elevation (deg)")
 
+            ### PLOT MAG DIFFERENCE BY CATALOG MAGNITUDE (gamma diagnostic)
+
+            catalog_mags_arr = np.array(catalog_mags)
+
+            # Plot catalog magnitude vs. fit residual
+            ax_m.scatter(catalog_mags_arr, self.photom_fit_resids, s=10, c='b', alpha=0.5,
+                            zorder=3, picker=5)
+
+            # Zero line
+            mag_min, mag_max = np.min(catalog_mags_arr), np.max(catalog_mags_arr)
+            ax_m.plot([mag_min, mag_max], [0, 0], linestyle='dashed', alpha=0.5, color='k')
+
+            ax_m.grid()
+            ax_m.set_ylabel("Fit res. (mag)")
+            ax_m.set_xlabel("Catalog mag - flat residuals indicate correct gamma")
+
             ###
 
             self.photometry_fit_x_list = [sc[0] for sc in star_coords]
@@ -7236,13 +7253,15 @@ class PlateTool(QtWidgets.QMainWindow):
             self.photometry_plot_highlight_artists = {
                 'ax_p': ax_p.plot([], [], 'ro', mfc='none', markersize=10, zorder=10)[0],
                 'ax_r': ax_r.plot([], [], 'ro', mfc='none', markersize=10, zorder=10)[0],
-                'ax_e': ax_e.plot([], [], 'ro', mfc='none', markersize=10, zorder=10)[0]
+                'ax_e': ax_e.plot([], [], 'ro', mfc='none', markersize=10, zorder=10)[0],
+                'ax_m': ax_m.plot([], [], 'ro', mfc='none', markersize=10, zorder=10)[0]
             }
 
             self.photometry_fit_data = {
                 'ax_p': (-2.5*lsp_arr, catalog_mags),
                 'ax_r': (radius_list, self.photom_fit_resids),
                 'ax_e': (elevation_list, self.photom_fit_resids),
+                'ax_m': (catalog_mags_arr.tolist(), self.photom_fit_resids),
             }
 
             fig_p.canvas.mpl_connect('pick_event', self.onPhotometryPlotPick)
