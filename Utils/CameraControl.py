@@ -964,16 +964,18 @@ def dvripCall(cam, cmd, opts, camera_settings_path='./camera_settings.json'):
         return
 
 
-def cameraControl(camera_ip, cmd, opts='', camera_settings_path='./camera_settings.json'):
+def cameraControl(camera_ip, camera_user, camera_pwd, cmd, opts='', camera_settings_path='./camera_settings.json'):
     """CameraControl - main entry point to the module
 
     Args:
         camera_ip (string): IPAddress of camera in dotted form eg 192.168.1.10
+        camera_user: username to login
+        camera_pwd: password of user
         cmd (string): Command to be executed
         opts (array of strings): Optional array of field, subfield and value for the SetParam command
     """
     # Process the IP camera control command
-    cam = dvr.DVRIPCam(camera_ip)
+    cam = dvr.DVRIPCam(camera_ip, user=camera_user, password=camera_pwd)
     if cam.login():
         try:
             dvripCall(cam, cmd, opts, camera_settings_path)
@@ -993,9 +995,11 @@ def cameraControlV2(config, cmd, opts=''):
         exit(1)
     # extract IP from config file
     camera_ip = re.findall(r"[0-9]+(?:\.[0-9]+){3}", config.deviceID)[0]
+    camera_user = re.findall(r'user=([^&]*)', config.deviceID)[0]
+    camera_pwd  = re.findall(r'password=([^&]*)', config.deviceID)[0]
 
     # camera_settings_path is sanity checked in ConfigReader so no checks needed here
-    cameraControl(camera_ip, cmd, opts, camera_settings_path=config.camera_settings_path)
+    cameraControl(camera_ip, camera_user, camera_pwd, cmd, opts, camera_settings_path=config.camera_settings_path)
 
 
 if __name__ == '__main__':
