@@ -8762,6 +8762,12 @@ class PlateTool(QtWidgets.QMainWindow):
         for k, v in variables.items():
             setattr(self, k, v)
         
+        # Init matplotlib figure references (stripped from saved state, not picklable)
+        if not hasattr(self, 'fig_astrometry'):
+            self.fig_astrometry = None
+        if not hasattr(self, 'fig_photometry'):
+            self.fig_photometry = None
+
         # Init catalog_stars_spectral_type if it doesn't exist (loading old state files)
         if not hasattr(self, 'catalog_stars_spectral_type'):
             self.catalog_stars_spectral_type = None
