@@ -1225,7 +1225,7 @@ if __name__ == "__main__":
             if not isinstance(start_time, bool):
                 log.info(f'Next start time: {start_time} UTC')
             else:
-                log.info(f'captureDuration returned f{start_time}')
+                log.info(f'captureDuration returned {start_time}')
 
         # Reboot the computer after processing is done for the previous night
         if ran_once and config.reboot_after_processing:
