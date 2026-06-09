@@ -1222,10 +1222,10 @@ if __name__ == "__main__":
 
             # Calculate when and how should the capture run
             start_time, duration = captureDuration(config.latitude, config.longitude, config.elevation)
-            if not isinstance(start_time, bool):
-                log.info(f'Next start time: {start_time} UTC')
-            else:
+            if isinstance(start_time, bool):
                 log.info(f'captureDuration returned {start_time}')
+            else:
+                log.info(f'Next start time: {start_time} UTC')
 
         # Reboot the computer after processing is done for the previous night
         if ran_once and config.reboot_after_processing:
