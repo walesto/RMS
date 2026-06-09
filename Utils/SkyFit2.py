@@ -7573,7 +7573,7 @@ class PlateTool(QtWidgets.QMainWindow):
 
             ax_m.grid()
             ax_m.set_ylabel("Fit res. (mag)")
-            ax_m.set_xlabel("Catalog mag - flat residuals indicate correct gamma")
+            ax_m.set_xlabel("Catalog mag (flat residuals indicate correct gamma)")
 
             ###
 
