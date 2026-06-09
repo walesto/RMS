@@ -7563,9 +7563,15 @@ class PlateTool(QtWidgets.QMainWindow):
 
             catalog_mags_arr = np.array(catalog_mags)
 
-            # Plot catalog magnitude vs. fit residual
-            ax_m.scatter(catalog_mags_arr, self.photom_fit_resids, s=10, c='b', alpha=0.5,
-                            zorder=3, picker=5)
+            # Plot catalog magnitude vs. fit residual, colored by SNR (clipped to the fit weighting
+            # range so the color shows how much the fit trusted each star)
+            snr_color = np.clip(snr_list, 0, 10)
+            sc_m = ax_m.scatter(catalog_mags_arr, self.photom_fit_resids, s=10, c=snr_color,
+                            cmap='viridis', vmin=0, vmax=10, alpha=0.7, zorder=3, picker=5)
+
+            # Add a colorbar for the SNR
+            cbar_m = fig_p.colorbar(sc_m, ax=ax_m)
+            cbar_m.set_label("S/N (clipped at 10)")
 
             # Zero line
             mag_min, mag_max = np.min(catalog_mags_arr), np.max(catalog_mags_arr)
@@ -7573,7 +7579,7 @@ class PlateTool(QtWidgets.QMainWindow):
 
             ax_m.grid()
             ax_m.set_ylabel("Fit res. (mag)")
-            ax_m.set_xlabel("Catalog mag (flat residuals indicate correct gamma)")
+            ax_m.set_xlabel("Catalog mag")
 
             ###
 
