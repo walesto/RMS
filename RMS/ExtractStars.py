@@ -447,8 +447,8 @@ def extractStarsImgHandle(img_handle,
         # Calculate image mean and stddev
         img_median = np.median(avepixel)
 
-        # Check if the image is too bright and skip the image
-        if img_median > max_global_intensity:
+        # Check if the image is too bright and skip the image (scale the cutoff to the image bit depth)
+        if img_median > max_global_intensity*(2**(config.bit_depth - 8)):
             return error_return
 
         # Get the image data from the average pixel image
@@ -456,12 +456,12 @@ def extractStarsImgHandle(img_handle,
 
         # Extract stars from the average pixel image
         status = extractStars(
-            img, img_median=img_median, 
+            img, img_median=img_median,
             mask=mask, gamma=config.gamma,
             max_star_candidates=config.max_stars, border=border,
-            neighborhood_size=neighborhood_size, intensity_threshold=intensity_threshold, 
-            segment_radius=segment_radius, roundness_threshold=roundness_threshold, 
-            max_feature_ratio=max_feature_ratio
+            neighborhood_size=neighborhood_size, intensity_threshold=intensity_threshold,
+            segment_radius=segment_radius, roundness_threshold=roundness_threshold,
+            max_feature_ratio=max_feature_ratio, bit_depth=config.bit_depth
         )
 
         # If the star extraction failed, return an empty list
