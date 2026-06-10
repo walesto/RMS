@@ -150,7 +150,8 @@ except Exception as exc:
 from RMS.Astrometry.ApplyAstrometry import xyToRaDecPP, raDecToXYPP, \
     rotationWrtHorizon, rotationWrtHorizonToPosAngle, computeFOVSize, photomLine, photometryFit, \
     rotationWrtStandard, rotationWrtStandardToPosAngle, correctVignetting, \
-    extinctionCorrectionTrueToApparent, applyAstrometryFTPdetectinfo, getFOVSelectionRadius
+    extinctionCorrectionTrueToApparent, applyAstrometryFTPdetectinfo, getFOVSelectionRadius, \
+    limitingMagnitude
 from RMS.Astrometry.AtmosphericExtinction import atmosphericExtinctionCorrection
 from RMS.Astrometry.StarClasses import CatalogStar, GeoPoint, PlanetPoint, PairedStars
 from RMS.Astrometry.StarFilters import filterPhotometricOutliers, filterBlendedStars
@@ -7135,6 +7136,32 @@ class PlateTool(QtWidgets.QMainWindow):
             self.distortion_center_marker2.setData(x=[x_centre], y=[y_centre])
 
 
+    def screenPlotDPI(self):
+        """ Compute a matplotlib figure DPI scaled to the screen resolution so that the
+            astrometry and photometry plot windows (and their fonts, markers and lines) stay
+            legible on high-resolution displays. Scaling the DPI grows the whole figure
+            uniformly, leaving the layout unchanged. The 1080p screen height is the baseline
+            (scale = 1), and the scale is clamped so plots never shrink below the baseline nor
+            become unwieldy on very large screens.
+
+        Return:
+            [float] Figure DPI to use when creating the plot.
+        """
+
+        base_dpi = plt.rcParams['figure.dpi']
+
+        try:
+            screen_height = QtWidgets.QApplication.primaryScreen().geometry().height()
+            scale = screen_height/1080.0
+        except Exception:
+            scale = 1.0
+
+        # Keep the plots at least baseline size and cap the growth on very large screens
+        scale = max(1.0, min(scale, 2.5))
+
+        return base_dpi*scale
+
+
     def photometry(self, show_plot=False, force_update=False):
         """
         Perform the photometry on selected stars. Updates residual text above and below picked stars
@@ -7280,6 +7307,14 @@ class PlateTool(QtWidgets.QMainWindow):
         self.platepar.mag_lev_stddev = self.photom_fit_stddev
         self.platepar.vignetting_coeff = vignetting_coeff
 
+        # Fit the limiting magnitude model: log10(S/N) vs the calibrated (vignetting + extinction
+        # corrected) apparent magnitude. The predicted magnitude per star equals the catalog
+        # magnitude minus the fit residual. Saturated stars are excluded (their flux is capped).
+        predicted_mags = np.array(catalog_mags) - np.array(self.photom_fit_resids)
+        self.limiting_mag_info = limitingMagnitude(
+            predicted_mags, np.array(snr_list), snr_targets=(5, 10),
+            exclude_mask=np.array(saturation_list))
+
         # Update the values in the platepar tab in the GUI
         self.tab.param_manager.updatePlatepar()
 
@@ -7383,7 +7418,7 @@ class PlateTool(QtWidgets.QMainWindow):
             #                                    gridspec_kw={'height_ratios': [3, 1, 1]})
 
             # Init plot for photometry
-            self.fig_photometry = plt.figure(figsize=(10, 5))  # Adjust the figure size as needed
+            self.fig_photometry = plt.figure(figsize=(10, 5), dpi=self.screenPlotDPI())
             fig_p = self.fig_photometry
 
             # Create a grid with 2 columns and 3 rows
@@ -7455,6 +7490,9 @@ class PlateTool(QtWidgets.QMainWindow):
             print()
             print('Photometric fit:')
             print(fit_info)
+            if self.limiting_mag_info is not None:
+                print('Limiting magnitude fit:')
+                print(self.limiting_mag_info['eqn_str'])
             print()
 
             # Plot the line fit
@@ -7563,19 +7601,38 @@ class PlateTool(QtWidgets.QMainWindow):
 
             catalog_mags_arr = np.array(catalog_mags)
 
-            # Plot catalog magnitude vs. fit residual, colored by SNR (clipped to the fit weighting
-            # range so the color shows how much the fit trusted each star)
-            snr_color = np.clip(snr_list, 0, 10)
+            # Plot catalog magnitude vs. fit residual, colored by SNR
+            snr_color = np.clip(snr_list, 0, 15)
             sc_m = ax_m.scatter(catalog_mags_arr, self.photom_fit_resids, s=10, c=snr_color,
-                            cmap='viridis', vmin=0, vmax=10, alpha=0.7, zorder=3, picker=5)
+                            cmap='viridis', vmin=0, vmax=15, alpha=0.7, zorder=3, picker=5)
 
-            # Add a colorbar for the SNR
-            cbar_m = fig_p.colorbar(sc_m, ax=ax_m)
-            cbar_m.set_label("S/N (clipped at 10)")
+            # Add a colorbar for the SNR, with notches at the limiting-magnitude S/N targets
+            cbar_m = fig_p.colorbar(sc_m, ax=ax_m, ticks=[0, 5, 10, 15])
+            cbar_m.set_label("S/N")
+            for snr_notch in (5, 10):
+                cbar_m.ax.axhline(snr_notch, color='r', linewidth=1.2)
 
             # Zero line
             mag_min, mag_max = np.min(catalog_mags_arr), np.max(catalog_mags_arr)
             ax_m.plot([mag_min, mag_max], [0, 0], linestyle='dashed', alpha=0.5, color='k')
+
+            # Draw the limiting magnitude at the target S/N values
+            if self.limiting_mag_info is not None:
+
+                # Colors set so the yellower line (higher S/N, brighter LM) is on the left and the
+                # greener line (lower S/N, fainter LM) is on the right
+                lm_colors = {5: 'green', 10: 'darkorange'}
+                for snr_target, lm_mag in self.limiting_mag_info['lm'].items():
+                    ax_m.axvline(lm_mag, linestyle='dashed', alpha=0.8,
+                                    color=lm_colors.get(snr_target, 'm'),
+                                    label="LM = {:.2f} mag @ S/N = {:g}".format(lm_mag, snr_target))
+
+                # Show the model equation so users can compute the LM for any S/N
+                ax_m.text(0.02, 0.03, self.limiting_mag_info['eqn_str'].split('\n')[0],
+                            transform=ax_m.transAxes, fontsize=7, va='bottom', ha='left',
+                            bbox=dict(boxstyle='round', fc='white', alpha=0.6, ec='none'))
+
+                ax_m.legend(fontsize=7, loc='upper right')
 
             ax_m.grid()
             ax_m.set_ylabel("Fit res. (mag)")
@@ -14949,7 +15006,7 @@ class PlateTool(QtWidgets.QMainWindow):
             (ax_azim, ax_elev, ax_skyradius),
             (ax_x, ax_y, ax_radius),
             (ax_snr, ax_mag, ax_fwhm)
-        ) = plt.subplots(ncols=3, nrows=3, facecolor=None, figsize=(12, 9))
+        ) = plt.subplots(ncols=3, nrows=3, facecolor=None, figsize=(12, 9), dpi=self.screenPlotDPI())
         fig_a = self.fig_astrometry
 
         # Set figure title
