@@ -9305,6 +9305,32 @@ class PlateTool(QtWidgets.QMainWindow):
             self.updateMeasurementRefractionCorrection()
 
 
+        # Add the missing mask drawing/brush state variables (old states predate them)
+        if not hasattr(self, "mask_draw_mode"):
+            self.mask_draw_mode = False
+        if not hasattr(self, "mask_current_polygon"):
+            self.mask_current_polygon = []
+        if not hasattr(self, "mask_polygons"):
+            self.mask_polygons = []
+        if not hasattr(self, "mask_dragging_vertex"):
+            self.mask_dragging_vertex = None
+        if not hasattr(self, "mask_brush_mode"):
+            self.mask_brush_mode = False
+        if not hasattr(self, "mask_brush_radius"):
+            self.mask_brush_radius = 20
+        if not hasattr(self, "mask_brush_painting"):
+            self.mask_brush_painting = False
+        if not hasattr(self, "mask_brush_erasing"):
+            self.mask_brush_erasing = False
+        if not hasattr(self, "mask_brush_last_pos"):
+            self.mask_brush_last_pos = None
+        if not hasattr(self, "mask_paint_layer"):
+            self.mask_paint_layer = None
+        if not hasattr(self, "mask_brush_stroke_history"):
+            self.mask_brush_stroke_history = []
+        if not hasattr(self, "mask_brush_max_undo"):
+            self.mask_brush_max_undo = 50
+
         # If setupUI hasn't already been called, call it
         if not hasattr(self, 'central'):
 
