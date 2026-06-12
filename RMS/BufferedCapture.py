@@ -1098,14 +1098,24 @@ class BufferedCapture(Process):
             "rtph264depay ! h264parse ! tee name=t"
             ).format(protocol_str, device_url)
 
+        # Optionally scale source video before further processing
+        video_scale = ''
+        if self.config.video_scale_width is not None and self.config.video_scale_height is not None:
+            video_scale = ("videoscale ! video/x-raw,width={:d},height={:d} ! ").format(self.config.video_scale_width, self.config.video_scale_height)
+
+        # Optionally crop source video before further processing
+        video_crop = ''
+        if self.config.video_crop is not None:
+            video_crop = ("videocrop {:s} ! ").format(self.config.video_crop)
+
         # Branch for processing
         processing_branch = (
             "t. ! queue ! {:s} ! "
-            "queue leaky=downstream max-size-buffers=100 max-size-bytes=0 max-size-time=0 ! "
+            "queue leaky=downstream max-size-buffers=100 max-size-bytes=0 max-size-time=0 ! {:s} {:s} "
             "videoconvert ! video/x-raw,format={:s} ! "
             "queue max-size-buffers=100 max-size-bytes=0 max-size-time=0 ! "
             "appsink max-buffers=100 drop=true sync=0 name=appsink"
-            ).format(gst_decoder, video_format)
+            ).format(gst_decoder, video_scale, video_crop, video_format)
         
          # Branch for storage - if video_file_dir is not None, save the raw stream to a file
         if video_file_dir is not None:
