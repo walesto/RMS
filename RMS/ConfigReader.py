@@ -1088,13 +1088,9 @@ def parseCapture(config, parser):
     # for scaling and or cropping source raw video for further processing
     if parser.has_option(section, "video_scale_width"):
         config.video_scale_width = parser.getint(section, "video_scale_width")
-        if config.video_scale_width.lower() == "none":
-            config.video_scale_width = None
 
     if parser.has_option(section, "video_scale_height"):
         config.video_scale_height = parser.getint(section, "video_scale_height")
-        if config.video_scale_height.lower() == "none":
-            config.video_scale_height = None
 
     if parser.has_option(section, "video_crop"):
         config.video_crop = parser.get(section, "video_crop")
