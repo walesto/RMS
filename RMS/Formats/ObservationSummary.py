@@ -1489,7 +1489,7 @@ def finalizeObservationSummary(config, night_data_dir, platepar=None):
     # Convert AU0004_
     _, time_section = os.path.basename(d['night_data_dir']).split("_",1)
     session_start_time = datetime.datetime.strptime(time_section, "%Y%m%d_%H%M%S_%f").replace(tzinfo=datetime.timezone.utc)
-    addObsParam("traceback_count", countTracebacksInLogs(session_start_time, config))
+    addObsParam(d, "traceback_count", countTracebacksInLogs(session_start_time, config))
 
 
     try:
