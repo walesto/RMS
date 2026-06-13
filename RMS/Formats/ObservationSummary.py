@@ -1292,7 +1292,8 @@ def writeToFile(config, file_path_and_name, night_dir):
 
     Arguments:
         config: [config] station config file.
-        file_path_and_name: [path full path to the target file.
+        file_path_and_name: [path] full path to the target file.
+        night_dir: [path] path to capture directory for the night
 
     Return:
         [string] string of key value pairs committed to the database since the start of the observation session.
@@ -1305,7 +1306,26 @@ def writeToFile(config, file_path_and_name, night_dir):
         summary_file_handle.flush()
 
 
-def writeToPNG(config, file_path_and_name, night_dir, line_gap=4, padding=10, col_gap=20, char_height=15, char_width=10):
+def writeToPNG(config, file_path_and_name, night_dir, font_size=16, line_gap=4, padding=10, col_gap=20, char_height=15, char_width=10):
+
+    """Write colon delimited text to png image.
+
+    Arguments:
+        config: [config] station config file.
+        file_path_and_name: [path full path to the target file.
+        night_dir: [path] path to capture directory for the night.
+
+    Keyword arguments:
+        font_size: [int] Font size.
+        line_gap: [int] Gap between lines.
+        padding: [int] Border around image.
+        col_gap: [int] gap between columns.
+        char_height: [int] height of characters.
+        char_width: [int] width of characters used to compute column width.
+
+    Return:
+        [string] string of key value pairs committed to the database since the start of the observation session.
+        """
 
     as_ascii = serialize(
         config,
@@ -1353,7 +1373,7 @@ def writeToPNG(config, file_path_and_name, night_dir, line_gap=4, padding=10, co
 
     img.save(file_path_and_name)
 
-
+    return os.path.basename(file_path_and_name)
 
 
 
