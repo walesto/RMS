@@ -1494,9 +1494,7 @@ def getObservationSummaryDict(data_dir, final=False, config=None):
         [dict]: Observation summary dict.
     """
 
-    log.info("Entered getObservationSummaryDict")
     if data_dir is None and config is not None:
-        log.info("Attempting to guess captured files directory")
         p = Path(os.path.join(config.data_dir, config.captured_dir))
         regex = re.compile(rf"^{config.stationID}_[0-9]{{8}}_[0-9]{{6}}_[0-9]{{6}}$")
 
@@ -1506,9 +1504,8 @@ def getObservationSummaryDict(data_dir, final=False, config=None):
             candidate_dirs.sort(key=lambda d: d.stat().st_ctime, reverse=True)
             if len(candidate_dirs):
                 data_dir = str(candidate_dirs[0].resolve())
-                log.info(f"Guessed directory {data_dir}")
             else:
-                log.warning("Found no matching captured dirs, unable to guess")
+                log.warning("Found no matching captured dirs, unable to determine directory to use")
                 return {}
         else:
             return {}
@@ -1520,9 +1517,8 @@ def getObservationSummaryDict(data_dir, final=False, config=None):
         if os.path.isfile(observation_summary_json_path):
             with open(observation_summary_json_path, "r") as f:
                 try:
-                    log.info(f"Found an existing {observation_summary_json_path}")
                     d = json.load(f)
-                    log.info(f"Loaded")
+                    log.info(f"Loaded {os.path.basename(observation_summary_json_path)}")
 
                 except:
                     os.remove(observation_summary_json_path)
@@ -1534,7 +1530,6 @@ def getObservationSummaryDict(data_dir, final=False, config=None):
     log.info("Creating a new observation summary dictionary")
     d = {'night_data_dir': data_dir}
     saveObservationSummaryDict(d, data_dir)
-
 
     return d
 
