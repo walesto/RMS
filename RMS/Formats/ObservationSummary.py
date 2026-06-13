@@ -68,6 +68,7 @@ else:
     import Utils.CameraControl27 as dvr
 
 DEBUG_PRINT = False
+RUNNING_FROM_CONSOLE = False
 
 OBSERVATION_SUMMARY_WORKING_NAME_JSON = "observation_summary_working.json"
 OBSERVATION_SUMMARY_NAME_JSON = "observation_summary.json"
@@ -896,7 +897,7 @@ def gatherCameraInformation(config, attempts=6, delay=10, sock_timeout=3):
 
     ip = re.search(r'(?:\d{1,3}\.){3}\d{1,3}', config.deviceID).group()
 
-    if not pingOnce(ip):
+    if RUNNING_FROM_CONSOLE and not pingOnce(ip):
         return ("Unavailable", "Unavailable", "Unavailable")
 
     for _ in range(attempts):
@@ -1764,6 +1765,8 @@ if __name__ == "__main__":
     cml_args = arg_parser.parse_args()
 
     #########################
+
+    RUNNING_FROM_CONSOLE = True
 
     # Load the config file
 
