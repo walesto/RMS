@@ -1242,7 +1242,7 @@ def serialize(config, format_nicely=True, as_json=False, night_directory=None, d
     if ordering is None:
         ordering = ['stationID',
                     'commit_date', 'commit_hash', 'remote_branch', 'repository_lag_remote_days',
-                    'media_backend','star_catalog_file',
+                    'star_catalog_file',
                     'hardware_version',
                     'captured_directories',
                     'storage_used_gb', 'storage_free_gb', 'storage_total_gb',
