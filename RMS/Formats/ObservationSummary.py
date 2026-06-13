@@ -1260,7 +1260,7 @@ def serialize(config, format_nicely=True, as_json=False, night_directory=None, d
                     'capture_duration_from_ephemeris', 'total_expected_fits_ephemeris', 'fits_file_shortfall_ephemeris',
                     'fits_file_shortfall_as_time_ephemeris',
                     'detections_after_ml',
-                    'media_backend','protocol_in_use','jitter_quality','dropped_frame_rate','kht_wrapper_count'
+                    'media_backend','protocol_in_use','jitter_quality','dropped_frame_rate','kht_wrapper_count',
                     'traceback_count']
 
     # Use this print call to check the ordering
