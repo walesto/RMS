@@ -1378,23 +1378,27 @@ def writeToPNG(config, file_path_and_name, night_dir, font_size=16, line_gap=4, 
         drop_keys_list="night_data_dir"
     ).encode("ascii", errors="ignore").decode("ascii")
 
-    lines = as_ascii.split("\n")
+    lines_list = as_ascii.split("\n")
+
+    # Remove final empty line if present
+    if lines_list and lines_list[-1].strip() == "":
+        lines_list.pop()
 
     # Split into two columns
-    mid = (len(lines) + 1) // 2
-    col1, col2 = lines[:mid], lines[mid:]
+    mid = (len(lines_list) + 1) // 2
+    col1_list, col2_list = lines_list[:mid], lines_list[mid:]
 
 
     # Monospace font
     font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 16)
 
     # Measure column widths
-    col1_width = max(char_width * len(line) for line in col1) if col1 else 0
-    col2_width = max(char_width * len(line) for line in col2) if col2 else 0
+    col1_width = max(char_width * len(line) for line in col1_list) if col1_list else 0
+    col2_width = max(char_width * len(line) for line in col2_list) if col2_list else 0
 
     # Total image size
     img_width = padding + col1_width + col_gap + col2_width + padding
-    img_height = padding + (char_height + line_gap) * max(len(col1), len(col2)) + padding
+    img_height = padding + (char_height + line_gap) * max(len(col1_list), len(col2_list)) + padding
 
     # Background
     img = Image.new("RGB", (img_width, img_height), bg_colour)
@@ -1402,14 +1406,14 @@ def writeToPNG(config, file_path_and_name, night_dir, font_size=16, line_gap=4, 
 
     # Draw column 1
     y = padding
-    for line in col1:
+    for line in col1_list:
         draw.text((padding, y), line, font=font, fill=text_colour)
         y += char_height + line_gap
 
     # Draw column 2
     x2 = padding + col1_width + col_gap
     y = padding
-    for line in col2:
+    for line in col2_list:
         draw.text((x2, y), line, font=font, fill=text_colour)
         y += char_height + line_gap
 
