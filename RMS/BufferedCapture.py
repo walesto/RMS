@@ -1445,6 +1445,13 @@ class BufferedCapture(Process):
                     self.device = cv2.VideoCapture(self.config.deviceID, cv2.CAP_V4L2)
                     self.device.set(cv2.CAP_PROP_CONVERT_RGB, 0)
 
+                    try:
+                        log.info("Getting observation summary dict")
+                        addObsParam(getObservationSummaryDict(None, config=self.config), "media_backend", self.video_device_type)
+                        log.info("Got observation summary dict")
+                    finally:
+                        pass
+
                     return True
                 
                 except Exception as e:
@@ -1457,6 +1464,14 @@ class BufferedCapture(Process):
             elif (self.config.media_backend == 'cv2') or self.media_backend_override:
                 log.info("Initialize OpenCV Device.")
                 self.device = cv2.VideoCapture(self.config.deviceID)
+
+                try:
+                    log.info("Getting observation summary dict")
+                    addObsParam(getObservationSummaryDict(None, config=self.config), "media_backend",
+                                self.video_device_type)
+                    log.info("Got observation summary dict")
+                finally:
+                    pass
 
                 return True
 
