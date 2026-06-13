@@ -1305,7 +1305,7 @@ def writeToFile(config, file_path_and_name, night_dir):
         summary_file_handle.flush()
 
 
-def writeToPNG(config, file_path_and_name, night_dir, line_gap=4, padding=10, col_gap=20, char_height=15, char_width=15):
+def writeToPNG(config, file_path_and_name, night_dir, line_gap=4, padding=10, col_gap=20, char_height=15, char_width=10):
 
     as_ascii = serialize(
         config,
