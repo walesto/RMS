@@ -1305,7 +1305,7 @@ def writeToFile(config, file_path_and_name, night_dir):
         summary_file_handle.flush()
 
 
-def writeToPNG(config, file_path_and_name, night_dir, line_gap=4, padding=10, col_gap=20, line_height=15):
+def writeToPNG(config, file_path_and_name, night_dir, line_gap=4, padding=10, col_gap=20, char_height=15, char_width=15):
 
     as_ascii = serialize(
         config,
@@ -1327,12 +1327,12 @@ def writeToPNG(config, file_path_and_name, night_dir, line_gap=4, padding=10, co
     text_color, bg_color = (255, 140, 0), (25, 10, 0)
 
     # Measure column widths
-    col1_width = max(font.getsize(line)[0] for line in col1) if col1 else 0
-    col2_width = max(font.getsize(line)[0] for line in col2) if col2 else 0
+    col1_width = max(char_width * len(line) for line in col1) if col1 else 0
+    col2_width = max(char_width * len(line) for line in col2) if col2 else 0
 
     # Total image size
     img_width = padding + col1_width + col_gap + col2_width + padding
-    img_height = padding + (line_height + line_gap) * max(len(col1), len(col2)) + padding
+    img_height = padding + (char_height + line_gap) * max(len(col1), len(col2)) + padding
 
     # Background
     img = Image.new("RGB", (img_width, img_height), bg_color)
@@ -1342,14 +1342,14 @@ def writeToPNG(config, file_path_and_name, night_dir, line_gap=4, padding=10, co
     y = padding
     for line in col1:
         draw.text((padding, y), line, font=font, fill=text_color)
-        y += line_height + line_gap
+        y += char_height + line_gap
 
     # Draw column 2
     x2 = padding + col1_width + col_gap
     y = padding
     for line in col2:
         draw.text((x2, y), line, font=font, fill=text_color)
-        y += line_height + line_gap
+        y += char_height + line_gap
 
     img.save(file_path_and_name)
 
