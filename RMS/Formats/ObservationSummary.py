@@ -1305,7 +1305,7 @@ def writeToFile(config, file_path_and_name, night_dir):
         summary_file_handle.flush()
 
 
-def writeToPNG(config, file_path_and_name, night_dir, line_gap=4, padding=10, col_gap=20):
+def writeToPNG(config, file_path_and_name, night_dir, line_gap=4, padding=10, col_gap=20, line_height=15):
 
     as_ascii = serialize(
         config,
@@ -1325,9 +1325,6 @@ def writeToPNG(config, file_path_and_name, night_dir, line_gap=4, padding=10, co
 
     # Colours orange on warm black
     text_color, bg_color = (255, 140, 0), (25, 10, 0)
-
-    # Measure line height (fixed)
-    _, line_height = font.getsize("A")
 
     # Measure column widths
     col1_width = max(font.getsize(line)[0] for line in col1) if col1 else 0
