@@ -789,8 +789,8 @@ def getNextStartTime(conn, time_point, tz_naive=True):
         return result
 
 
-def countTracebacksInLogs(session_start, config):
-    """Count the number of tracebacks in log files from the current session.
+def countKeyStringsInLogs(session_start, config, key_string="Traceback (most recent call last)"):
+    """Count the number of occurences of key_string in log files from the current session.
 
     Scans all log files in the log directory that were modified after the session's
     start_time (from the observation database) for lines containing 'Traceback
@@ -799,6 +799,9 @@ def countTracebacksInLogs(session_start, config):
     Arguments:
         session_start: [datetime] Time object for session start
         config: [config] RMS configuration instance.
+
+    Keyword arguments:
+        key_string: [str] Optional default "Traceback (most recent call last)" - string to be sought
 
     Return:
         count: [int] Number of tracebacks found, or 0 if logs cannot be read.
@@ -810,7 +813,7 @@ def countTracebacksInLogs(session_start, config):
         return 0
 
     # Find log files modified after the session start
-    traceback_count = 0
+    key_string_count = 0
     log_pattern = "log_{}_".format(config.stationID)
 
     for filename in sorted(os.listdir(log_dir)):
@@ -827,12 +830,12 @@ def countTracebacksInLogs(session_start, config):
         try:
             with open(filepath, 'r', errors='replace') as f:
                 for line in f:
-                    if 'Traceback (most recent call last)' in line:
-                        traceback_count += 1
+                    if key_string in line:
+                        key_string_count += 1
         except Exception:
             continue
 
-    return traceback_count
+    return key_string_count
 
 
 def gatherCameraInformation(config, attempts=6, delay=10, sock_timeout=3):
@@ -1220,7 +1223,7 @@ def serialize(config, format_nicely=True, as_json=False, night_directory=None, d
                     'capture_duration_from_ephemeris', 'total_expected_fits_ephemeris', 'fits_file_shortfall_ephemeris',
                     'fits_file_shortfall_as_time_ephemeris',
                     'detections_after_ml',
-                    'media_backend','protocol_in_use','jitter_quality','dropped_frame_rate',
+                    'media_backend','protocol_in_use','jitter_quality','dropped_frame_rate','kht_wrapper_count'
                     'traceback_count']
 
     # Use this print call to check the ordering
@@ -1609,8 +1612,8 @@ def finalizeObservationSummary(config, night_data_dir, platepar=None):
     # Convert AU0004_
     _, time_section = os.path.basename(d['night_data_dir']).split("_",1)
     session_start_time = datetime.datetime.strptime(time_section, "%Y%m%d_%H%M%S_%f").replace(tzinfo=datetime.timezone.utc)
-    addObsParam(d, "traceback_count", countTracebacksInLogs(session_start_time, config))
-
+    addObsParam(d, "traceback_count", countKeyStringsInLogs(session_start_time, config))
+    addObsParam(d, "kht_wrapper_count", countKeyStringsInLogs(session_start_time, config, key_string="undefined symbol: kht_wrapper"))
 
     try:
         timeSyncStatus(config, d)
