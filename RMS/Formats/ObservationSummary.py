@@ -43,9 +43,6 @@ import tempfile
 import ephem
 import traceback
 import argparse
-import cv2
-import numpy as np
-
 
 from RMS.ConfigReader import parse
 from RMS.Misc import niceFormat, isRaspberryPi, sanitise, getRMSStyleFileName, getRmsRootDir, UTCFromTimestamp
@@ -56,7 +53,7 @@ from RMS.CaptureModeSwitcher import SWITCH_HORIZON_DEG
 from RMS.Formats.FTPdetectinfo import findFTPdetectinfoFile, readFTPdetectinfo
 from RMS.Logger import getLogger
 from pathlib import Path
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 import RMS.ConfigReader as cr
 import subprocess
@@ -70,9 +67,6 @@ else:
     # Python2 compatible version
     import Utils.CameraControl27 as dvr
 
-
-
-
 DEBUG_PRINT = False
 
 OBSERVATION_SUMMARY_WORKING_NAME_JSON = "observation_summary_working.json"
@@ -85,7 +79,15 @@ NIGHT_DATA_DIR_COL = "night_data_dir"
 
 
 def pingOnce(host):
+    """Quickly detect if a host is pingable
 
+    Arguments:
+        host: [str} ip address of host to be pinged.
+
+    Return:
+        [bool]: True if pinged, otherwise False.
+
+    """
     try:
         result = subprocess.run(
             ["ping", "-c", "1", "-W", "1", host],
@@ -161,20 +163,48 @@ def getObsDBConn(config, force_delete=False):
     return conn
 
 def getColumns(conn):
+    """Get the columns in the observation table.
+
+    Arguments:
+        conn: connection to database.
+
+    Return:
+        [set]: Set of columns in table.
+    """
 
     cursor = conn.execute(f"PRAGMA table_info({OBSERVATIONS_TABLE_NAME})")
     return {row[1] for row in cursor.fetchall()}
 
 def addRequiredColumns(conn, d):
+    """For each key in d if not already a column in table, add as a column.
+
+    Arguments:
+        conn: connection to database.
+        d: [dict] Dictionary of keys and values for the observation summary.
+
+     Return:
+        Nothing.
+    """
 
     existing = getColumns(conn)
     for key in d:
         if key.lower() not in existing:
             sql_command = f"ALTER TABLE {OBSERVATIONS_TABLE_NAME} ADD COLUMN {key.lower()} TEXT"
-            print(sql_command)
             conn.execute(sql_command)
 
 def storeDictInDB(conn, d, debug=False):
+    """
+    Store the dict d in the observation summary database.
+
+    Arguments:
+        conn: connection to database.
+        d: [dict] Dictionary of keys and values for the observation summary.
+
+
+    Return:
+        Nothing.
+    """
+
     # Ensure schema is up to date
     addRequiredColumns(conn, d)
 
@@ -188,19 +218,15 @@ def storeDictInDB(conn, d, debug=False):
     if "night_data_dir" in clean:
         clean["night_data_dir"] = os.path.basename(clean["night_data_dir"])
 
-
     columns = list(clean.keys())
     placeholders = ", ".join("?" for _ in columns)
     values = [clean[col] for col in columns]
 
-
     assignments = ", ".join(f"{col}=excluded.{col}" for col in columns if col != "night_data_dir")
-
 
     if debug:
         for c, v in zip(columns, values):
             print(f"{c:40} -> {repr(v)}")
-
 
     sql_command = ""
     sql_command += f"INSERT INTO {OBSERVATIONS_TABLE_NAME} ({', '.join(columns)})\n"
@@ -360,9 +386,7 @@ def getTimeClient():
     return "Not recognized"
 
 def timeSyncStatus(config, d, force_client=None):
-
-    """
-    Add time sync information to the observation summary.
+    """Add time sync information to the observation summary.
 
     Arguments:
         config: [Config] Configuration object.
@@ -425,7 +449,17 @@ def timeSyncStatus(config, d, force_client=None):
     return ahead_ms
 
 def getDaysSinceLastDetection(config, data_dir, d=None, debug=False):
+    """Get the number of days since the last meteor detection
 
+    Arguments:
+        config: [config] RMS configuration instance.
+        data_dir: [path] path to the data_dir.
+        d: [dict] Obseravation summary dictonary.
+        debug: [bool] Run in debug mode.
+
+    Returns:
+        days_since_last_detection: [int].
+    """
 
 
     last_fits_file_for_session_sql = ""
@@ -482,8 +516,10 @@ def getDaysSinceLastDetection(config, data_dir, d=None, debug=False):
         cursor = conn.execute(last_detection_time_for_session_sql)
         result =  cursor.fetchone()[0]
         last_detection_time_for_session = datetime.datetime.strptime(result, "%Y-%m-%d %H:%M:%S")
+
         # Guard against missing fits files causing negative time since last detection
         seconds_since_last_detection = max((time_last_fits_file_for_session - last_detection_time_for_session).total_seconds(), 0)
+
         days_since_last_detection = seconds_since_last_detection / (60 * 60 * 23.934)
         conn.close()
 
@@ -1309,7 +1345,9 @@ def writeToFile(config, file_path_and_name, night_dir):
         summary_file_handle.flush()
 
 
-def writeToPNG(config, file_path_and_name, night_dir, font_size=16, line_gap=4, padding=10, col_gap=20, char_height=15, char_width=10):
+def writeToPNG(config, file_path_and_name, night_dir, font_size=16, line_gap=4, padding=10,
+               col_gap=20, char_height=15, char_width=10,
+               text_colour=(255, 140, 0), bg_colour=(25, 10, 0), alpha_blur=0.8, radius_blur=2.0):
 
     """Write colon delimited text to png image.
 
@@ -1325,6 +1363,8 @@ def writeToPNG(config, file_path_and_name, night_dir, font_size=16, line_gap=4, 
         col_gap: [int] gap between columns.
         char_height: [int] height of characters.
         char_width: [int] width of characters used to compute column width.
+        text_colour: (r,g,b) Colour for text, optional default (255,140,0)
+        bg_colour: (r,g,b) Colour for text, optional default (25,10,0) - VT320 style
 
     Return:
         [string] string of key value pairs committed to the database since the start of the observation session.
@@ -1346,9 +1386,6 @@ def writeToPNG(config, file_path_and_name, night_dir, font_size=16, line_gap=4, 
     # Monospace font
     font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 16)
 
-    # Colours orange on warm black
-    text_color, bg_color = (255, 140, 0), (25, 10, 0)
-
     # Measure column widths
     col1_width = max(char_width * len(line) for line in col1) if col1 else 0
     col2_width = max(char_width * len(line) for line in col2) if col2 else 0
@@ -1358,21 +1395,25 @@ def writeToPNG(config, file_path_and_name, night_dir, font_size=16, line_gap=4, 
     img_height = padding + (char_height + line_gap) * max(len(col1), len(col2)) + padding
 
     # Background
-    img = Image.new("RGB", (img_width, img_height), bg_color)
+    img = Image.new("RGB", (img_width, img_height), bg_colour)
     draw = ImageDraw.Draw(img)
 
     # Draw column 1
     y = padding
     for line in col1:
-        draw.text((padding, y), line, font=font, fill=text_color)
+        draw.text((padding, y), line, font=font, fill=text_colour)
         y += char_height + line_gap
 
     # Draw column 2
     x2 = padding + col1_width + col_gap
     y = padding
     for line in col2:
-        draw.text((x2, y), line, font=font, fill=text_color)
+        draw.text((x2, y), line, font=font, fill=text_colour)
         y += char_height + line_gap
+
+
+    glow = img.filter(ImageFilter.GaussianBlur(radius=radius_blur))
+    img = Image.blend(glow, img, alpha=alpha_blur)
 
     img.save(file_path_and_name)
 
@@ -1383,7 +1424,6 @@ def writeToPNG(config, file_path_and_name, night_dir, font_size=16, line_gap=4, 
 
 
 def writeToJSON(config, file_path_and_name, night_dir):
-
     """Write as a json.
     Arguments:
         config: [config] station config file.
@@ -1400,7 +1440,16 @@ def writeToJSON(config, file_path_and_name, night_dir):
 
 
 def getTimeOfFirstAndLastDetectionInDir(data_dir):
+    """Get the time of the first and last meteor detections in the data_dir
 
+    Arguments:
+        data_dir:[path] Path to the data_dir to be checked
+
+    Return:
+        [str] First detection time
+        [str] Last detection time
+
+    """
 
     first_detection, last_detection = "0", "0"
     log.info(f"Looking for FTP file in {data_dir}")
@@ -1483,8 +1532,7 @@ def getObservationSummaryDict(data_dir, final=False, config=None):
     return d
 
 def saveObservationSummaryDict(d, night_dir=None):
-
-    """
+    """Save the observation summary dictionary as a json.
 
     Arguments:
         d: Observation summary dict.
@@ -1585,8 +1633,7 @@ def startObservationSummaryReport(config, night_data_dir, duration, force_delete
     return "Opening a new observations summary"
 
 def finalizeObservationSummary(config, night_data_dir, platepar=None):
-
-    """ Enters the parameters known at the end of observation into the database.
+    """Enters the parameters known at the end of observation into the database.
 
     Arguments:
         config: [config] config file.
@@ -1609,8 +1656,8 @@ def finalizeObservationSummary(config, night_data_dir, platepar=None):
     time_first_fits_file, time_last_fits_file, \
     total_expected_fits, total_expected_fits_ephemeris = nightSummaryData(config, night_data_dir)
 
-    # Convert AU0004_
-    _, time_section = os.path.basename(d['night_data_dir']).split("_",1)
+    # Convert AU0004_20260612_100206_674582 into a python time object
+    _, time_section = os.path.basename(d['night_data_dir']).split("_",maxsplit=1)
     session_start_time = datetime.datetime.strptime(time_section, "%Y%m%d_%H%M%S_%f").replace(tzinfo=datetime.timezone.utc)
     addObsParam(d, "traceback_count", countKeyStringsInLogs(session_start_time, config, key_string="Traceback (most recent call last)"))
     addObsParam(d, "kht_wrapper_count", countKeyStringsInLogs(session_start_time, config, key_string="undefined symbol: kht_wrapper"))
