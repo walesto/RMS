@@ -1439,7 +1439,7 @@ def startObservationSummaryReport(config, night_data_dir, duration, force_delete
     captured_directories = captureDirectories(os.path.join(config.data_dir, config.captured_dir), config.stationID)
     addObsParam(d, "captured_directories", captured_directories)
     try:
-        #sensor, firmware, build_date = gatherCameraInformation(config)
+        sensor, firmware, build_date = gatherCameraInformation(config)
         addObsParam(d, "camera_information", sensor)
         addObsParam(d, "camera_firmware_version", firmware)
         addObsParam(d, "camera_firmware_build_date", build_date)
