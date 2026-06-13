@@ -43,6 +43,8 @@ import tempfile
 import ephem
 import traceback
 import argparse
+import cv2
+import numpy as np
 
 
 from RMS.ConfigReader import parse
@@ -54,8 +56,10 @@ from RMS.CaptureModeSwitcher import SWITCH_HORIZON_DEG
 from RMS.Formats.FTPdetectinfo import findFTPdetectinfoFile, readFTPdetectinfo
 from RMS.Logger import getLogger
 from pathlib import Path
+from PIL import Image, ImageDraw, ImageFont
 
 import RMS.ConfigReader as cr
+import subprocess
 
 # Get the logger from the main module
 log = getLogger("rmslogger")
@@ -74,9 +78,23 @@ DEBUG_PRINT = False
 OBSERVATION_SUMMARY_WORKING_NAME_JSON = "observation_summary_working.json"
 OBSERVATION_SUMMARY_NAME_JSON = "observation_summary.json"
 OBSERVATION_SUMMARY_NAME_TXT = "observation_summary.txt"
+OBSERVATION_SUMMARY_NAME_PNG = "observation_summary.png"
 OBSERVATIONS_TABLE_NAME = "observations"
 OBSERVATION_DB_FILE_NAME = "observation.db"
 NIGHT_DATA_DIR_COL = "night_data_dir"
+
+
+def pingOnce(host):
+
+    try:
+        result = subprocess.run(
+            ["ping", "-c", "1", "-W", "1", host],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
 
 
 def getObsDBConn(config, force_delete=False):
@@ -839,6 +857,9 @@ def gatherCameraInformation(config, attempts=6, delay=10, sock_timeout=3):
 
     ip = re.search(r'(?:\d{1,3}\.){3}\d{1,3}', config.deviceID).group()
 
+    if not pingOnce(ip):
+        return ("Unavailable", "Unavailable", "Unavailable")
+
     for _ in range(attempts):
         try:
             cam = dvr.DVRIPCam(ip, timeout=sock_timeout)
@@ -1090,9 +1111,12 @@ def getRemoteBranchNameForCommit(repo, commit):
         remote_branch_name: [str] the full name of the remote branch where commit exists.
     """
 
+
+    # This is the simple case, our latest commit is the HEAD
+
     local_branch_list = []
     try:
-        local_branch_list = subprocess.check_output(["git", "branch", "-a", "--contains", commit], cwd=repo).decode(
+        local_branch_list = subprocess.check_output(["git", "branch", "-r", "--points-at", commit], cwd=repo).decode(
             "utf-8").split("\n")
     except:
         pass
@@ -1103,6 +1127,27 @@ def getRemoteBranchNameForCommit(repo, commit):
         if branch_stripped.startswith("remotes/"):
             remote_branch_name = branch_stripped
 
+    # If we are not at the HEAD, then get all the branches which contain the commit.
+
+    # 2. Branches that *contain* the commit
+    try:
+        contains = subprocess.check_output(
+            ["git", "branch", "-r", "--contains", commit],
+            cwd=repo
+        ).decode().splitlines()
+    except Exception:
+        contains = []
+
+    contains = [c.strip() for c in contains if c.strip()]
+
+    if contains:
+        # If the branch is origin/main or origin/pre-release; then that is almost certainly where we are
+        for preferred in ["origin/master", "origin/prerelease"]:
+            if preferred in contains:
+                return preferred
+        return contains[0]
+
+    # Fall back return
     return remote_branch_name
 
 def daysBehind():
@@ -1258,6 +1303,64 @@ def writeToFile(config, file_path_and_name, night_dir):
         as_ascii = serialize(config, night_directory=night_dir, drop_keys_list="night_data_dir").encode("ascii", errors="ignore").decode("ascii")
         summary_file_handle.write(as_ascii)
         summary_file_handle.flush()
+
+
+def writeToPNG(config, file_path_and_name, night_dir, line_gap=4, padding=10, col_gap=20):
+
+    as_ascii = serialize(
+        config,
+        night_directory=night_dir,
+        drop_keys_list="night_data_dir"
+    ).encode("ascii", errors="ignore").decode("ascii")
+
+    lines = as_ascii.split("\n")
+
+    # Split into two columns
+    mid = (len(lines) + 1) // 2
+    col1, col2 = lines[:mid], lines[mid:]
+
+
+    # Monospace font
+    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 16)
+
+    # Colours orange on warm black
+    text_color, bg_color = (255, 140, 0), (25, 10, 0)
+
+    # Measure line height (fixed)
+    _, line_height = font.getsize("A")
+
+    # Measure column widths
+    col1_width = max(font.getsize(line)[0] for line in col1) if col1 else 0
+    col2_width = max(font.getsize(line)[0] for line in col2) if col2 else 0
+
+    # Total image size
+    img_width = padding + col1_width + col_gap + col2_width + padding
+    img_height = padding + (line_height + line_gap) * max(len(col1), len(col2)) + padding
+
+    # Background
+    img = Image.new("RGB", (img_width, img_height), bg_color)
+    draw = ImageDraw.Draw(img)
+
+    # Draw column 1
+    y = padding
+    for line in col1:
+        draw.text((padding, y), line, font=font, fill=text_color)
+        y += line_height + line_gap
+
+    # Draw column 2
+    x2 = padding + col1_width + col_gap
+    y = padding
+    for line in col2:
+        draw.text((x2, y), line, font=font, fill=text_color)
+        y += line_height + line_gap
+
+    img.save(file_path_and_name)
+
+
+
+
+
+
 
 def writeToJSON(config, file_path_and_name, night_dir):
 
@@ -1555,6 +1658,7 @@ def finalizeObservationSummary(config, night_data_dir, platepar=None):
 
     writeToFile(config, getRMSStyleFileName(night_data_dir, OBSERVATION_SUMMARY_NAME_TXT), night_data_dir)
     writeToJSON(config, getRMSStyleFileName(night_data_dir, OBSERVATION_SUMMARY_NAME_JSON), night_data_dir)
+    writeToPNG(config, getRMSStyleFileName(night_data_dir, OBSERVATION_SUMMARY_NAME_PNG), night_data_dir)
     working_json_path = getRMSStyleFileName(night_data_dir, OBSERVATION_SUMMARY_WORKING_NAME_JSON)
     if os.path.exists(working_json_path):
         if os.path.isfile(working_json_path):
