@@ -44,6 +44,7 @@ import ephem
 import traceback
 import argparse
 
+
 from RMS.ConfigReader import parse
 from RMS.Misc import niceFormat, isRaspberryPi, sanitise, getRMSStyleFileName, getRmsRootDir, UTCFromTimestamp
 from RMS.Formats.FFfits import filenameToDatetimeStr
@@ -458,12 +459,13 @@ def getDaysSinceLastDetection(config, data_dir, d=None, debug=False):
 
     try:
         conn = getObsDBConn(config)
-        storeDictInDB(conn,d, debug=True)
+        storeDictInDB(conn,d, debug=False)
 
         cursor = conn.execute(last_detection_time_for_session_sql)
         result =  cursor.fetchone()[0]
         last_detection_time_for_session = datetime.datetime.strptime(result, "%Y-%m-%d %H:%M:%S")
-        seconds_since_last_detection = (time_last_fits_file_for_session - last_detection_time_for_session).total_seconds()
+        # Guard against missing fits files causing negative time since last detection
+        seconds_since_last_detection = max((time_last_fits_file_for_session - last_detection_time_for_session).total_seconds(), 0)
         days_since_last_detection = seconds_since_last_detection / (60 * 60 * 23.934)
         conn.close()
 
@@ -768,6 +770,53 @@ def getNextStartTime(conn, time_point, tz_naive=True):
         result = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         return result
 
+
+def countTracebacksInLogs(session_start, config):
+    """Count the number of tracebacks in log files from the current session.
+
+    Scans all log files in the log directory that were modified after the session's
+    start_time (from the observation database) for lines containing 'Traceback
+    (most recent call last)'.
+
+    Arguments:
+        session_start: [datetime] Time object for session start
+        config: [config] RMS configuration instance.
+
+    Return:
+        count: [int] Number of tracebacks found, or 0 if logs cannot be read.
+    """
+
+    log_dir = os.path.join(config.data_dir, config.log_dir)
+
+    if not os.path.isdir(log_dir):
+        return 0
+
+    # Find log files modified after the session start
+    traceback_count = 0
+    log_pattern = "log_{}_".format(config.stationID)
+
+    for filename in sorted(os.listdir(log_dir)):
+        if not filename.endswith(".log") or log_pattern not in filename:
+            continue
+
+        filepath = os.path.join(log_dir, filename)
+
+        # Only consider log files modified after the session started
+        file_mtime = datetime.datetime.fromtimestamp(os.path.getmtime(filepath),tz=datetime.timezone.utc)
+        if file_mtime < session_start:
+            continue
+
+        try:
+            with open(filepath, 'r', errors='replace') as f:
+                for line in f:
+                    if 'Traceback (most recent call last)' in line:
+                        traceback_count += 1
+        except Exception:
+            continue
+
+    return traceback_count
+
+
 def gatherCameraInformation(config, attempts=6, delay=10, sock_timeout=3):
     """ Gather information about the sensor in use.
         Retry the DVRIP handshake until it works, or we exhaust attempts.
@@ -789,11 +838,12 @@ def gatherCameraInformation(config, attempts=6, delay=10, sock_timeout=3):
     """
 
     ip = re.search(r'(?:\d{1,3}\.){3}\d{1,3}', config.deviceID).group()
+
     for _ in range(attempts):
         try:
             cam = dvr.DVRIPCam(ip, timeout=sock_timeout)
             if cam.login():
-                sensor = cam.get_upgrade_info()['Hardware']
+                sys_info = cam.get_system_info()
                 cam.close()
                 sensor = sys_info.get('HardWare', 'Unknown')
                 fw = sys_info.get('SoftWareVersion', '')
@@ -1113,7 +1163,7 @@ def serialize(config, format_nicely=True, as_json=False, night_directory=None, d
                     'storage_used_gb', 'storage_free_gb', 'storage_total_gb',
                     'camera_lens','camera_fov_h','camera_fov_v',
                     'camera_pointing_alt','camera_pointing_az',
-                    'camera_information',
+                    'camera_information', 'camera_firmware_build_date', 'camera_firmware_version',
                     'clock_measurement_source', 'clock_synchronized', 'clock_ahead_ms', 'clock_error_uncertainty_ms',
                     'start_time', 'duration_from_start_of_observation', 'continuous_capture',
                     'photometry_good', 'star_catalog_file',
@@ -1125,7 +1175,11 @@ def serialize(config, format_nicely=True, as_json=False, night_directory=None, d
                     'capture_duration_from_ephemeris', 'total_expected_fits_ephemeris', 'fits_file_shortfall_ephemeris',
                     'fits_file_shortfall_as_time_ephemeris',
                     'detections_after_ml',
-                    'media_backend','protocol_in_use','jitter_quality','dropped_frame_rate']
+                    'media_backend','protocol_in_use','jitter_quality','dropped_frame_rate',
+                    'traceback_count']
+
+    # Use this print call to check the ordering
+    # print("Ordering {}".format(ordering))
 
     if drop_keys_list:
         if isinstance(drop_keys_list, str):
@@ -1385,7 +1439,7 @@ def startObservationSummaryReport(config, night_data_dir, duration, force_delete
     captured_directories = captureDirectories(os.path.join(config.data_dir, config.captured_dir), config.stationID)
     addObsParam(d, "captured_directories", captured_directories)
     try:
-        sensor, firmware, build_date = gatherCameraInformation(config)
+        #sensor, firmware, build_date = gatherCameraInformation(config)
         addObsParam(d, "camera_information", sensor)
         addObsParam(d, "camera_firmware_version", firmware)
         addObsParam(d, "camera_firmware_build_date", build_date)
@@ -1394,11 +1448,7 @@ def startObservationSummaryReport(config, night_data_dir, duration, force_delete
         addObsParam(d, "camera_firmware_version", "Unavailable")
         addObsParam(d, "camera_firmware_build_date", "Unavailable")
 
-    # Hardcoded for now, but should be calculated based on the config value
-    no_of_frames_per_fits_file = 256
 
-    # Calculate the number of fits files expected for the duration
-    fps = config.fps
     saveObservationSummaryDict(d)
     try:
         conn = getObsDBConn(config)
@@ -1436,6 +1486,10 @@ def finalizeObservationSummary(config, night_data_dir, platepar=None):
     time_first_fits_file, time_last_fits_file, \
     total_expected_fits, total_expected_fits_ephemeris = nightSummaryData(config, night_data_dir)
 
+    # Convert AU0004_
+    _, time_section = os.path.basename(d['night_data_dir']).split("_",1)
+    session_start_time = datetime.datetime.strptime(time_section, "%Y%m%d_%H%M%S_%f").replace(tzinfo=datetime.timezone.utc)
+    traceback_count = countTracebacksInLogs(session_start_time, config)
 
 
     try:
@@ -1540,7 +1594,6 @@ if __name__ == "__main__":
 
     conn = getObsDBConn(config, force_delete=False)
     full_path_capture_directory = os.path.join(config.data_dir, config.captured_dir)
-    start_time = datetime.datetime.strptime("2025-06-25 08:03:37", "%Y-%m-%d %H:%M:%S")
     d = getObservationSummaryDict(None, config=config)
 
     ftp_detect_info_file = None
@@ -1568,7 +1621,10 @@ if __name__ == "__main__":
     print("Duration time was {:.2f} hours".format(duration/3600))
     print("End time was {}".format(end_time))
     print(f"Days since last detection {getDaysSinceLastDetection(config, latest_dir, debug=True)}")
-    print(getTimeOfFirstAndLastDetectionInDir(latest_dir))
+    try:
+        print(getTimeOfFirstAndLastDetectionInDir(latest_dir))
+    except:
+        pass
 
     startObservationSummaryReport(config, latest_dir, duration, force_delete=False)
     pp = Platepar()
