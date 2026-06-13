@@ -1365,6 +1365,8 @@ def writeToPNG(config, file_path_and_name, night_dir, font_size=16, line_gap=4, 
         char_width: [int] width of characters used to compute column width.
         text_colour: (r,g,b) Colour for text, optional default (255,140,0)
         bg_colour: (r,g,b) Colour for text, optional default (25,10,0) - VT320 style
+        alpha_blur: [float] alpha for blurring overlay
+        radius_blur: [float] pixel radius for blurring
 
     Return:
         [string] string of key value pairs committed to the database since the start of the observation session.
