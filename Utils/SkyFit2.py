@@ -20,6 +20,7 @@ import configparser
 
 import cv2
 import numpy as np
+import zlib
 from PIL import Image
 
 import matplotlib.pyplot as plt
@@ -149,7 +150,8 @@ except Exception as exc:
 from RMS.Astrometry.ApplyAstrometry import xyToRaDecPP, raDecToXYPP, \
     rotationWrtHorizon, rotationWrtHorizonToPosAngle, computeFOVSize, photomLine, photometryFit, \
     rotationWrtStandard, rotationWrtStandardToPosAngle, correctVignetting, \
-    extinctionCorrectionTrueToApparent, applyAstrometryFTPdetectinfo, getFOVSelectionRadius
+    extinctionCorrectionTrueToApparent, applyAstrometryFTPdetectinfo, getFOVSelectionRadius, \
+    limitingMagnitude
 from RMS.Astrometry.AtmosphericExtinction import atmosphericExtinctionCorrection
 from RMS.Astrometry.StarClasses import CatalogStar, GeoPoint, PlanetPoint, PairedStars
 from RMS.Astrometry.StarFilters import filterPhotometricOutliers, filterBlendedStars
@@ -171,7 +173,7 @@ from RMS.Pickling import loadPickle, savePickle
 from RMS.Math import angularSeparation, RMSD, vectNorm
 from RMS.Misc import decimalDegreesToSexHours
 from RMS.Routines.AddCelestialGrid import updateRaDecGrid, updateAzAltGrid
-from RMS.Routines.CustomPyqtgraphClasses import ViewBox, TextItem, TextItemList, Crosshair, Plus, Cross, CursorItem, ImageItem, RightOptionsTab, qmessagebox
+from RMS.Routines.CustomPyqtgraphClasses import ViewBox, TextItem, TextItemList, Crosshair, Plus, Cross, CursorItem, BrushCursorItem, ImageItem, RightOptionsTab, qmessagebox
 from RMS.Routines.GreatCircle import fitGreatCircle, greatCircle
 from RMS.Routines.SphericalPolygonCheck import sphericalPolygonCheck
 from RMS.Routines.Image import loadFlat, loadDark, applyFlat, applyDark, signalToNoise, gammaCorrectionImage, adjustLevels, saveImage, loadImage
@@ -182,7 +184,8 @@ from Utils.KalmanFilter import KalmanFilter
 
 import pyximport
 pyximport.install(setup_args={'include_dirs': [np.get_include()]})
-from RMS.Astrometry.CyFunctions import subsetCatalog, equatorialCoordPrecession, matchStars
+from RMS.Astrometry.CyFunctions import subsetCatalog, equatorialCoordPrecession
+from RMS.Astrometry.MatchStars import matchStars
 from RMS.Routines.SatellitePositions import SatellitePredictor, loadTLEs, loadRobustTLEs, findClosestTLEFile, SKYFIELD_AVAILABLE
 from RMS.Astrometry.ApplyAstrometry import xyToRaDecPP
 from RMS.Astrometry.Conversions import datetime2JD
@@ -1784,11 +1787,28 @@ class CalibrationFilesDialog(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(dlg)
 
         checkboxes = []
-        for label, path in self._locations:
+        for i, (label, path) in enumerate(self._locations):
             cb = QtWidgets.QCheckBox(self._locationMenuLabel(label, path))
             cb.setProperty("path", path)
+            if i == 0:
+                cb.setChecked(True)
             layout.addWidget(cb)
             checkboxes.append(cb)
+
+        # OK / Cancel
+        btn_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        btn_box.accepted.connect(dlg.accept)
+        btn_box.rejected.connect(dlg.reject)
+        ok_btn = btn_box.button(QtWidgets.QDialogButtonBox.Ok)
+
+        def updateOkButton():
+            ok_btn.setEnabled(any(cb.isChecked() for cb in checkboxes))
+
+        for cb in checkboxes:
+            cb.stateChanged.connect(updateOkButton)
+
+        updateOkButton()
 
         # Browse button to add a custom location
         browse_btn = QtWidgets.QPushButton("Add location...")
@@ -1807,21 +1827,18 @@ class CalibrationFilesDialog(QtWidgets.QDialog):
             cb = QtWidgets.QCheckBox("Custom - {}".format(self._shortenPath(resolved)))
             cb.setProperty("path", resolved)
             cb.setChecked(True)
+            cb.stateChanged.connect(updateOkButton)
             layout.insertWidget(len(checkboxes), cb)
             checkboxes.append(cb)
             # Persist for future use across dialog open/close within this session
             if resolved not in self.plate_tool._file_manager_custom_locations:
                 self.plate_tool._file_manager_custom_locations.append(resolved)
             self._locations.append(("Custom", resolved))
+            updateOkButton()
 
         browse_btn.clicked.connect(on_browse)
         layout.addWidget(browse_btn)
 
-        # OK / Cancel
-        btn_box = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-        btn_box.accepted.connect(dlg.accept)
-        btn_box.rejected.connect(dlg.reject)
         layout.addWidget(btn_box)
 
         if dlg.exec_() == QtWidgets.QDialog.Accepted:
@@ -2274,6 +2291,7 @@ class PlateTool(QtWidgets.QMainWindow):
             
             if os.path.isfile(self.geo_points_input):
                 self.geo_points_obj = GeoPoints(self.geo_points_input)
+                print("Geo points loaded from:", self.geo_points_input)
 
             else:
                 print("The file with geo points does not exist:", self.geo_points_input)
@@ -2430,6 +2448,16 @@ class PlateTool(QtWidgets.QMainWindow):
         self.mask_polygons = []  # List of completed polygons
         self.mask_dragging_vertex = None  # (polygon_idx, vertex_idx) or ('current', vertex_idx)
 
+        # Brush mask state
+        self.mask_brush_mode = False
+        self.mask_brush_radius = 20
+        self.mask_brush_painting = False
+        self.mask_brush_erasing = False
+        self.mask_brush_last_pos = None
+        self.mask_paint_layer = None
+        self.mask_brush_stroke_history = []
+        self.mask_brush_max_undo = 50
+
         # Flat image for mask editing background
         self.flat_image_data = None  # Loaded flat.bmp data
         self.mask_use_flat_background = False  # Whether to show flat as background
@@ -2479,7 +2507,7 @@ class PlateTool(QtWidgets.QMainWindow):
 
             if pp_path is None:
                 # User cancelled — abort loading
-                return False
+                sys.exit()
 
             if pp_path:
                 self.loadPlatepar(platepar_file=pp_path)
@@ -2867,6 +2895,41 @@ class PlateTool(QtWidgets.QMainWindow):
         self.astrometry_quad_markers2.setZValue(5)
         self.zoom_window.addItem(self.astrometry_quad_markers2)
 
+        # Astrometry fit plot pick highlight marker (main window)
+        self.astrometry_plot_highlight_marker = pg.ScatterPlotItem()
+        self.astrometry_plot_highlight_marker.setPen('r', width=3)  # red
+        self.astrometry_plot_highlight_marker.setBrush((0, 0, 0, 0))
+        self.astrometry_plot_highlight_marker.setSize(25)
+        self.astrometry_plot_highlight_marker.setSymbol('o')  # circle
+        self.astrometry_plot_highlight_marker.setZValue(6)
+        self.img_frame.addItem(self.astrometry_plot_highlight_marker)
+
+        # Outer highlight marker for better visibility
+        self.astrometry_plot_highlight_marker_outer = pg.ScatterPlotItem()
+        self.astrometry_plot_highlight_marker_outer.setPen('y', width=2)  # yellow
+        self.astrometry_plot_highlight_marker_outer.setBrush((0, 0, 0, 0))
+        self.astrometry_plot_highlight_marker_outer.setSize(45)
+        self.astrometry_plot_highlight_marker_outer.setSymbol('o')
+        self.astrometry_plot_highlight_marker_outer.setZValue(5.9)
+        self.img_frame.addItem(self.astrometry_plot_highlight_marker_outer)
+
+        # Astrometry fit plot pick highlight marker (zoom window)
+        self.astrometry_plot_highlight_marker2 = pg.ScatterPlotItem()
+        self.astrometry_plot_highlight_marker2.setPen('r', width=4)
+        self.astrometry_plot_highlight_marker2.setBrush((0, 0, 0, 0))
+        self.astrometry_plot_highlight_marker2.setSize(40)
+        self.astrometry_plot_highlight_marker2.setSymbol('o')
+        self.astrometry_plot_highlight_marker2.setZValue(6)
+        self.zoom_window.addItem(self.astrometry_plot_highlight_marker2)
+        
+        self.astrometry_plot_highlight_marker2_outer = pg.ScatterPlotItem()
+        self.astrometry_plot_highlight_marker2_outer.setPen('y', width=3)
+        self.astrometry_plot_highlight_marker2_outer.setBrush((0, 0, 0, 0))
+        self.astrometry_plot_highlight_marker2_outer.setSize(65)
+        self.astrometry_plot_highlight_marker2_outer.setSymbol('o')
+        self.astrometry_plot_highlight_marker2_outer.setZValue(5.9)
+        self.zoom_window.addItem(self.astrometry_plot_highlight_marker2_outer)
+
         # Store astrometry.net solution info (populated when astrometry.net is run)
         self.astrometry_solution_info = None
         self.astrometry_stars_visible = False
@@ -3170,7 +3233,8 @@ class PlateTool(QtWidgets.QMainWindow):
         # Add main image
         self.img_type_flag = 'avepixel'
         self.img = ImageItem(img_handle=self.img_handle, gamma=gamma, invert=invert,
-                             saturation_mask=self.saturation_mask)
+                             saturation_mask=self.saturation_mask,
+                             saturation_threshold=getattr(self, 'saturation_threshold', None))
         self.img_frame.addItem(self.img)
         self.img_frame.autoRange(padding=0)
 
@@ -3224,6 +3288,12 @@ class PlateTool(QtWidgets.QMainWindow):
 
         # Storage for completed polygon graphics
         self.mask_polygon_items = []
+
+        # Brush cursor (cyan circle showing brush size)
+        self.brush_cursor = BrushCursorItem()
+        self.brush_cursor.setZValue(20)
+        self.img_frame.addItem(self.brush_cursor)
+        self.brush_cursor.hide()
 
         self.tab = RightOptionsTab(self)
         self.tab.hist.setImageItem(self.img)
@@ -3292,6 +3362,10 @@ class PlateTool(QtWidgets.QMainWindow):
         self.tab.mask.sigUseFlatToggled.connect(self.toggleMaskFlatBackground)
         self.tab.mask.sigUnsavedChanged.connect(self.updateFileManagerButton)
         self.tab.mask.sigInvertMask.connect(self.invertMaskPolygons)
+        self.tab.mask.sigBrushModeToggled.connect(self.toggleMaskBrushMode)
+        self.tab.mask.sigClearBrushStrokes.connect(self.clearBrushStrokes)
+        self.tab.mask.sigBrushSizeChanged.connect(self.setBrushSize)
+        self.tab.mask.sigUndoBrushStroke.connect(self.undoBrushStroke)
 
         # Check for flat.bmp and setup mask tab
         self.checkAndSetupFlatForMask()
@@ -3529,7 +3603,6 @@ class PlateTool(QtWidgets.QMainWindow):
             self._original_catalog_file = self.config.star_catalog_file
             self._original_band_ratios = self.config.star_catalog_band_ratios
 
-            self.initMaskFromFile()
             self.detectInputType(use_fr_files=self.use_fr_files)
 
             if self.img_handle is None:
@@ -3545,7 +3618,9 @@ class PlateTool(QtWidgets.QMainWindow):
             self.img_zoom.changeHandle(self.img_handle)
             self.tab.hist.setLevels(0, 2**(8*self.img.data.itemsize) - 1)
 
-            # Now that image data is available, render the mask overlay
+            # Now that the new image dimensions are available, load this station's mask (or clear a
+            #   previous station's mask if this one has none), then render the overlay
+            self.initMaskFromFile()
             self.updateMaskOverlayImage()
 
             self.catalog_stars = self.loadCatalogStars(self.config.catalog_mag_limit)
@@ -3648,6 +3723,17 @@ class PlateTool(QtWidgets.QMainWindow):
 
 
     def onGridChanged(self):
+
+        if self.platepar is None:
+            self.celestial_grid.hide()
+            return
+
+        # Hide the grid if the FOV is smaller than 5 degrees
+        fov_w, fov_h = computeFOVSize(self.platepar)
+        if (fov_w < 5) or (fov_h < 5):
+            self.celestial_grid.hide()
+            return
+
         if self.grid_visible == 0:
             self.celestial_grid.hide()
         elif self.grid_visible == 1:
@@ -4070,7 +4156,7 @@ class PlateTool(QtWidgets.QMainWindow):
 
             # Plot geo points
             if self.catalog_stars_visible:
-                geo_size = 5
+                geo_size = 20
                 self.geo_markers.setData(x=self.geo_x_filtered + 0.5, y=self.geo_y_filtered + 0.5, \
                     size=geo_size)
                 self.geo_markers2.setData(x=self.geo_x_filtered + 0.5, y=self.geo_y_filtered + 0.5, \
@@ -4678,13 +4764,6 @@ class PlateTool(QtWidgets.QMainWindow):
             if self.platepar is not None:
                 self.platepar.gamma = value
 
-        # Sync display gamma (Settings tab) with camera gamma
-        self.img.setGamma(value)
-        self.img_zoom.setGamma(value)
-        # Block signals to prevent infinite loop
-        self.tab.settings.img_gamma.blockSignals(True)
-        self.tab.settings.img_gamma.setValue(value)
-        self.tab.settings.img_gamma.blockSignals(False)
         self.updateLeftLabels()
 
     def updateSegmentRadius(self, value):
@@ -4782,6 +4861,9 @@ class PlateTool(QtWidgets.QMainWindow):
               f"neighborhood={self.override_neighborhood_size}, segment_radius={self.override_segment_radius}, "
               f"max_stars={self.override_max_stars}, gamma={self.override_gamma:.3f}")
 
+        # Ensure unsaved mask polygons are applied to the detection
+        self.mask = MaskStructure(self.generateMaskImage())
+
         # Call extractStarsFF with override parameters
         try:
             # Temporarily modify config to use override parameters
@@ -4802,6 +4884,7 @@ class PlateTool(QtWidgets.QMainWindow):
             self.config.max_feature_ratio = self.override_max_feature_ratio
             self.config.roundness_threshold = self.override_roundness_threshold
 
+            extra_info = {}
             try:
                 star_list = extractStarsFF(
                     self.dir_path,
@@ -4809,7 +4892,8 @@ class PlateTool(QtWidgets.QMainWindow):
                     config=self.config,
                     flat_struct=self.flat_struct if hasattr(self, 'flat_struct') else None,
                     dark=self.dark if hasattr(self, 'dark') else None,
-                    mask=self.mask if hasattr(self, 'mask') else None
+                    mask=self.mask if hasattr(self, 'mask') else None,
+                    extra_info=extra_info
                 )
             finally:
                 # Restore original config values
@@ -4847,7 +4931,8 @@ class PlateTool(QtWidgets.QMainWindow):
                 print(f"  Using override gamma={self.override_gamma:.3f} for photometry")
 
                 self.updateCalstars()
-                self.tab.star_detection.updateStatus(True, len(star_data))
+                num_candidates = extra_info.get('num_candidates')
+                self.tab.star_detection.updateStatus(True, len(star_data), candidate_count=num_candidates)
 
             else:
                 print("  No stars detected")
@@ -4861,6 +4946,9 @@ class PlateTool(QtWidgets.QMainWindow):
     def redetectAllImages(self):
         """ Re-detect stars on all images using override parameters. """
         print("Re-detecting stars on all images...")
+
+        # Ensure unsaved mask polygons are applied to the detection
+        self.mask = MaskStructure(self.generateMaskImage())
 
         # Get list of all FF files that exist on disk, excluding placeholders
         ff_files = [f for f in self.calstars.keys()
@@ -4908,13 +4996,15 @@ class PlateTool(QtWidgets.QMainWindow):
                 QtWidgets.QApplication.processEvents()
 
                 try:
+                    extra_info = {}
                     star_list = extractStarsFF(
                         self.dir_path,
                         ff_name,
                         config=self.config,
                         flat_struct=self.flat_struct if hasattr(self, 'flat_struct') else None,
                         dark=self.dark if hasattr(self, 'dark') else None,
-                        mask=self.mask if hasattr(self, 'mask') else None
+                        mask=self.mask if hasattr(self, 'mask') else None,
+                        extra_info=extra_info
                     )
 
                     if star_list:
@@ -4922,6 +5012,12 @@ class PlateTool(QtWidgets.QMainWindow):
                         # CALSTARS format: Y(0) X(1) IntensSum(2) Ampltd(3) FWHM(4) BgLvl(5) SNR(6) NSatPx(7)
                         star_data = list(zip(y_arr, x_arr, intensity, amplitude, fwhm, background, snr, saturated_count))
                         self.star_detection_override_data[ff_name] = star_data
+                        
+                        # Store candidate count in star data if needed, or handle separately. 
+                        # For redetectAllImages, we usually just update the main status for the last one
+                        num_candidates = extra_info.get('num_candidates')
+                        self.tab.star_detection.updateStatus(True, len(star_data), candidate_count=num_candidates)
+                        
                         success_count += 1
 
                 except Exception as e:
@@ -5090,20 +5186,20 @@ class PlateTool(QtWidgets.QMainWindow):
             # Early bail-out check after Phase 1
             # With high intensity threshold (bright stars only), we expect good precision.
             # If false positive ratio > 80%, the calibration is likely wrong.
-            if best_fp_ratio_seg > 0.80:
+            if best_fp_ratio_seg > 0.50:
                 precision_seg = (1.0 - best_fp_ratio_seg) * 100
 
                 print(f"\n  *** TUNING ABORTED ***")
                 print(f"  Only {best_true_pos_seg} true positive(s) with "
                       f"{best_fp_ratio_seg:.0%} false positive ratio.")
-                print(f"  Precision: {precision_seg:.1f}% (expected >20% with bright stars)")
+                print(f"  Precision: {precision_seg:.1f}% (expected >50% with bright stars)")
                 print(f"  This suggests the platepar calibration is incorrect or the image has issues.")
                 self.status_bar.showMessage("Tuning aborted: calibration appears invalid")
                 qmessagebox(
                     message="Tuning aborted: could not find enough matching stars.\n\n"
                             f"Only {best_true_pos_seg} star(s) matched catalog positions "
                             f"({precision_seg:.1f}% precision).\n\n"
-                            "With bright stars only (high threshold), precision should be >20%.\n\n"
+                            "With bright stars only (high threshold), precision should be >50%.\n\n"
                             "This usually means:\n"
                             "• The platepar calibration is incorrect\n"
                             "• The image pointing doesn't match the platepar\n"
@@ -5176,18 +5272,20 @@ class PlateTool(QtWidgets.QMainWindow):
             # If precision is very low, the calibration is likely wrong
             if n_detected > 0:
                 precision = n_true_pos / n_detected
-                # Bail out if precision < 10% - even with many detections, this means
-                # most detections are noise/artifacts, not real stars matching catalog
-                if precision < 0.10:
+                # Bail out if precision < 50% or fewer than 8 true positives. Either means the
+                # detections are noise-dominated / too sparse to fit reliably - which on a bad or
+                # uncalibrated platepar otherwise drives Phase 3 to chase coincidental matches.
+                if (precision < 0.50) or (n_true_pos < 8):
                     print(f"\n  *** TUNING ABORTED ***")
                     print(f"  Only {n_true_pos} true positive(s) out of {n_detected} detections ({precision:.1%} precision).")
+                    print(f"  Need >=8 true positives at >=50% precision for a reliable tune.")
                     print(f"  This suggests the platepar calibration is incorrect or the image has issues.")
                     self.status_bar.showMessage("Tuning aborted: calibration appears invalid")
                     qmessagebox(
-                        message="Tuning aborted: very low detection precision.\n\n"
+                        message="Tuning aborted: detection quality too low.\n\n"
                                 f"Only {n_true_pos} star(s) out of {n_detected} detections "
                                 f"matched catalog positions ({precision:.1%} precision).\n\n"
-                                "Expected precision >10% for a valid calibration.\n\n"
+                                "A reliable tune needs at least 8 matched stars at >=50% precision.\n\n"
                                 "This usually means:\n"
                                 "• The platepar calibration is incorrect\n"
                                 "• The image pointing doesn't match the platepar\n"
@@ -5214,6 +5312,24 @@ class PlateTool(QtWidgets.QMainWindow):
             QtWidgets.QApplication.processEvents()
 
             best_lm = self._findOptimalCatalogLM(jd, tp_x, tp_y, n_true_pos)
+
+            # Success gate: _findOptimalCatalogLM returns None when no reliable LM was found (the
+            #   detections could only be matched via a spurious, over-deep catalog). Abort rather
+            #   than apply a junk LM that explodes the catalog and masquerades as a good optimum.
+            if best_lm is None:
+                print(f"\n  *** TUNING ABORTED ***")
+                print(f"  Could not find a reliable catalog LM - detections only matched via an "
+                      f"over-deep (coincidental) catalog.")
+                self.status_bar.showMessage("Tuning aborted: no reliable catalog LM")
+                qmessagebox(
+                    message="Tuning aborted: could not find a reliable catalog limiting magnitude.\n\n"
+                            "The detected stars could only be matched by resorting to an over-deep\n"
+                            "catalog (coincidental matches). This usually means the platepar pointing\n"
+                            "is off.\n\n"
+                            "Please verify your calibration before trying again.",
+                    title="Tuning Aborted", message_type="warning")
+                return
+
             print(f"\n  Selected catalog LM: {best_lm:.1f}")
 
             # Restore original config
@@ -5757,6 +5873,12 @@ class PlateTool(QtWidgets.QMainWindow):
         print("    Coarse pass (0.5 mag steps):")
         coarse_lm_values = np.arange(3.0, 10.1, 0.5)
 
+        # Guardrails so a bad/uncalibrated platepar can't drive the LM to the max chasing
+        #   coincidental matches: never explore a catalog deeper than COST_CEILING cat/match per
+        #   added match (spurious), nor larger than CATALOG_CAP stars (cause-agnostic bound).
+        COST_CEILING = 100      # catalog stars per added match above which a match is coincidental
+        CATALOG_CAP = 8000      # max catalog stars to consider during the LM search
+
         prev_matched, prev_catalog = 0, 0
         best_lm = coarse_lm_values[0]
         best_matches = 0
@@ -5764,6 +5886,12 @@ class PlateTool(QtWidgets.QMainWindow):
 
         for i, test_lm in enumerate(coarse_lm_values):
             n_matched, n_catalog = count_matches_at_lm(test_lm)
+
+            # Hard catalog-count cap: stop before pulling in an absurd catalog
+            if n_catalog > CATALOG_CAP:
+                print(f"    -> Catalog cap reached at LM={test_lm:.1f} "
+                      f"({n_catalog} > {CATALOG_CAP} stars); stopping")
+                break
 
             # Calculate diminishing returns metrics
             match_gain = n_matched - prev_matched
@@ -5776,6 +5904,14 @@ class PlateTool(QtWidgets.QMainWindow):
                 cost = catalog_gain / match_gain
                 print(f"      LM={test_lm:.1f}: {n_matched}/{target_matches} ({coverage:.0%}), "
                       f"+{match_gain} matches, cost={cost:.0f} cat/match")
+
+                # Absolute cost ceiling: a match that costs this many catalog stars is coincidental,
+                #   not real. Applied even with <2 prior costs, which is exactly the sparse-match
+                #   case (bad platepar) that the relative knee below cannot catch.
+                if cost > COST_CEILING:
+                    print(f"    -> Spurious match at LM={test_lm:.1f} "
+                          f"(cost={cost:.0f} > {COST_CEILING} cat/match); stopping")
+                    break
 
                 # Detect cost knee: cost jumps dramatically relative to prior steps
                 if len(prev_costs) >= 2:
@@ -5823,6 +5959,17 @@ class PlateTool(QtWidgets.QMainWindow):
             if n_matched > final_matches:
                 final_lm = test_lm
                 final_matches = n_matched
+
+        # Success gate: a good calibration often detects many stars fainter than the cost-effective
+        #   catalog LM, so a low coverage *fraction* is normal (the faint detections legitimately
+        #   have no bright catalog counterpart). Only fail if too few real (low-cost) matches were
+        #   found in absolute terms to align on. The spurious / bad-platepar cases are already
+        #   stopped by the cost ceiling and the Phase 1/2 precision gates upstream.
+        min_matches = 5
+        if final_matches < min_matches:
+            print(f"    -> Only {final_matches} reliable matches found (< {min_matches}); "
+                  f"no reliable catalog LM")
+            return None
 
         print(f"    -> Selected LM={final_lm:.1f} with {final_matches} matches")
         return final_lm
@@ -5950,29 +6097,88 @@ class PlateTool(QtWidgets.QMainWindow):
     ###################################################################################################
 
     def initMaskFromFile(self):
-        """Auto-load mask.bmp if it exists in the working directory."""
+        """Auto-load mask.bmp if present, else clear any mask carried over from a previous station.
+
+        Must be called after the new station's image handle is in place, since the mask is rendered
+        against the current image dimensions.
+        """
+
+        # Reset ALL mask state - critical when switching stations/directories. Clearing only the
+        #   paint layer (not the polygons or the rendered overlay) left the previous station's mask
+        #   visible whenever the new station had no mask file.
+        if self.mask_brush_mode:
+            self._exitBrushMode()
+        self.mask_polygons = []
+        self.mask_current_polygon = []
+        self.mask_paint_layer = None
+        self.mask_brush_stroke_history = []
+        self.tab.mask.setUndoEnabled(False)
+
         mask_path = os.path.join(self.dir_path, "mask.bmp")
         if os.path.exists(mask_path):
             self.loadMaskFromFile(mask_path)
+        else:
+            # No mask for this station - clear any leftover overlay/outlines from the previous one
+            self.updateMaskDisplay()
+
+        # Sync the detection mask to the loaded-or-cleared state so it doesn't leak across stations
+        if self.img.data is not None:
+            self.mask = MaskStructure(self.generateMaskImage())
 
     def toggleMaskDrawMode(self):
         """Toggle mask polygon drawing mode."""
         self.mask_draw_mode = self.tab.mask.draw_button.isChecked()
         if self.mask_draw_mode:
             self.mask_current_polygon = []
-            # Disable hyperlinks on star labels so clicks go to mask drawing
+            if self.mask_brush_mode:
+                self._exitBrushMode()
             self.spectral_type_text_list.setInteractionEnabled(False)
         else:
-            # If there are points, close the polygon
             if len(self.mask_current_polygon) >= 3:
                 self.mask_polygons.append(self.mask_current_polygon.copy())
                 self.tab.mask.setUnsaved(True)
             self.mask_current_polygon = []
             self.tab.mask.setDrawMode(False)
-            # Re-enable hyperlinks on star labels
             self.spectral_type_text_list.setInteractionEnabled(True)
         self.updateMaskDisplay()
-        self.tab.mask.updateStatus(len(self.mask_polygons))
+        self._updateMaskStatus()
+
+    def toggleMaskBrushMode(self):
+        """Toggle mask brush painting mode."""
+        self.mask_brush_mode = self.tab.mask.brush_button.isChecked()
+
+        if self.mask_brush_mode:
+
+            # Close any polygon currently being drawn before entering brush mode
+            if self.mask_draw_mode:
+                if len(self.mask_current_polygon) >= 3:
+                    self.mask_polygons.append(self.mask_current_polygon.copy())
+                    self.tab.mask.setUnsaved(True)
+                self.mask_current_polygon = []
+                self.mask_draw_mode = False
+                self.tab.mask.setDrawMode(False)
+
+            self.brush_cursor.setRadius(self.mask_brush_radius)
+            self.brush_cursor.show()
+
+            # Disable star-label hyperlinks so clicks go to brush painting
+            self.spectral_type_text_list.setInteractionEnabled(False)
+
+        else:
+            self._exitBrushMode()
+            self.spectral_type_text_list.setInteractionEnabled(True)
+
+        self.updateMaskDisplay()
+        self._updateMaskStatus()
+
+    def _exitBrushMode(self):
+        """Deactivate brush painting and reset all brush interaction state."""
+        self.mask_brush_mode = False
+        self.mask_brush_painting = False
+        self.mask_brush_erasing = False
+        self.mask_brush_last_pos = None
+        self.brush_cursor.hide()
+        self.tab.mask.setBrushMode(False)
 
     def addMaskPoint(self, x, y):
         """Add a point to the current polygon being drawn."""
@@ -5997,7 +6203,8 @@ class PlateTool(QtWidgets.QMainWindow):
 
         self.mask_current_polygon.append((x, y))
         self.updateMaskDisplay()
-        self.tab.mask.updateStatus(len(self.mask_polygons), len(self.mask_current_polygon))
+        self.tab.mask.updateStatus(len(self.mask_polygons), len(self.mask_current_polygon),
+                                           has_brush_strokes=self._hasBrushStrokes())
 
     def closeMaskPolygon(self):
         """Close the current polygon and add it to the list."""
@@ -6008,18 +6215,121 @@ class PlateTool(QtWidgets.QMainWindow):
         self.mask_draw_mode = False
         self.tab.mask.setDrawMode(False)
         self.updateMaskDisplay()
-        self.tab.mask.updateStatus(len(self.mask_polygons))
+        self._updateMaskStatus()
 
     def clearMaskPolygons(self):
-        """Clear all mask polygons."""
+        """Clear all mask polygons and the paint layer (full visual reset)."""
         self.mask_polygons = []
         self.mask_current_polygon = []
         self.mask_draw_mode = False
         self.mask_dragging_vertex = None
+        self.mask_paint_layer = None
+        self.mask_brush_stroke_history = []
         self.tab.mask.setDrawMode(False)
+        self.tab.mask.setUndoEnabled(False)
         self.tab.mask.setUnsaved(True)
         self.updateMaskDisplay()
-        self.tab.mask.updateStatus(0)
+        self._updateMaskStatus()
+
+    def setBrushSize(self, size):
+        """Set brush radius from slider."""
+        self.mask_brush_radius = size
+        self.brush_cursor.setRadius(size)
+
+    def brushStrokeBegin(self):
+        """Save a compressed undo snapshot before a new brush stroke begins.
+
+        Snapshots are stored as (shape, zlib-compressed bytes) tuples.
+        None is stored when the paint layer doesn't exist yet, so undoing
+        the very first stroke restores a clean slate.
+        """
+        if self.mask_paint_layer is not None:
+            snapshot = (self.mask_paint_layer.shape,
+                        zlib.compress(self.mask_paint_layer.tobytes()))
+        else:
+            snapshot = None
+
+        self.mask_brush_stroke_history.append(snapshot)
+
+        # Drop oldest entry when the history depth limit is reached
+        if len(self.mask_brush_stroke_history) > self.mask_brush_max_undo:
+            self.mask_brush_stroke_history.pop(0)
+
+        self.tab.mask.setUndoEnabled(True)
+
+    def brushPaintAt(self, x, y):
+        """Paint or erase a circle at (x, y), interpolating from the last position.
+
+        Paint layer pixel encoding:
+            0 = untouched (transparent to the polygon layer)
+            1 = painted (masked, shown red in overlay)
+            2 = erased  (unmasked, overrides any polygon beneath)
+
+        Note: img.data is stored (width, height) in this codebase (shape[0]=X, shape[1]=Y),
+        so the paint layer is allocated as (height, width) to match OpenCV convention.
+        """
+        if self.img.data is None:
+            return
+
+        # shape[0] is X (width), shape[1] is Y (height) — see codebase convention
+        img_width = self.img.data.shape[0]
+        img_height = self.img.data.shape[1]
+
+        if self.mask_paint_layer is None:
+            self.mask_paint_layer = np.zeros((img_height, img_width), dtype=np.uint8)
+
+        value = 2 if self.mask_brush_erasing else 1
+        radius = int(self.mask_brush_radius)
+        center = (int(round(x)), int(round(y)))
+
+        if self.mask_brush_last_pos is not None:
+            # Draw a thick line from the previous position to fill gaps between mouse events
+            cv2.line(self.mask_paint_layer, self.mask_brush_last_pos, center,
+                     value, thickness=radius * 2)
+        else:
+            # First point of a new stroke: draw a single filled circle
+            cv2.circle(self.mask_paint_layer, center, radius, value, -1)
+
+        self.mask_brush_last_pos = center
+        self.updateMaskOverlayImage()
+
+    def undoBrushStroke(self):
+        """Undo the last brush stroke by restoring the previous snapshot."""
+        if not self.mask_brush_stroke_history:
+            return
+
+        snapshot = self.mask_brush_stroke_history.pop()
+
+        if snapshot is None:
+            # The snapshot before the very first stroke: paint layer was empty
+            self.mask_paint_layer = None
+        else:
+            shape, data = snapshot
+            # frombuffer returns a read-only view, so .copy() is required
+            self.mask_paint_layer = np.frombuffer(
+                zlib.decompress(data), dtype=np.uint8).reshape(shape).copy()
+
+        self.tab.mask.setUnsaved(True)
+        self.tab.mask.setUndoEnabled(len(self.mask_brush_stroke_history) > 0)
+        self.updateMaskOverlayImage()
+
+    def clearBrushStrokes(self):
+        """Clear all brush paint strokes."""
+        self.mask_paint_layer = None
+        self.mask_brush_stroke_history = []
+        self.tab.mask.setUndoEnabled(False)
+        self.tab.mask.setUnsaved(True)
+        self.updateMaskDisplay()
+        self._updateMaskStatus()
+
+    def _hasBrushStrokes(self):
+        """Check if there are any brush strokes on the paint layer."""
+        return self.mask_paint_layer is not None and np.any(self.mask_paint_layer != 0)
+
+    def _updateMaskStatus(self):
+        """Update mask tab status label with polygon + brush info."""
+        self.tab.mask.updateStatus(len(self.mask_polygons),
+                                    has_brush_strokes=self._hasBrushStrokes())
 
     def invertMaskPolygons(self):
         """ Invert the current mask polygons using the mask image. """
@@ -6054,9 +6364,12 @@ class PlateTool(QtWidgets.QMainWindow):
 
         print(f"Mask inverted: {len(self.mask_polygons)} new polygon(s) created.")
 
+        self.mask_paint_layer = None
+        self.mask_brush_stroke_history = []
+        self.tab.mask.setUndoEnabled(False)
         self.tab.mask.setUnsaved(True)
         self.updateMaskDisplay()
-        self.tab.mask.updateStatus(len(self.mask_polygons))
+        self._updateMaskStatus()
 
     def findNearestMaskVertex(self, x, y, threshold=15):
         """Find the nearest vertex to (x, y) within threshold.
@@ -6136,14 +6449,15 @@ class PlateTool(QtWidgets.QMainWindow):
             insert_idx = edge_ref[1]
             self.mask_current_polygon.insert(insert_idx, (x, y))
             self.updateMaskDisplay()
-            self.tab.mask.updateStatus(len(self.mask_polygons), len(self.mask_current_polygon))
+            self.tab.mask.updateStatus(len(self.mask_polygons), len(self.mask_current_polygon),
+                                           has_brush_strokes=self._hasBrushStrokes())
         else:
             poly_idx, insert_idx = edge_ref
             if poly_idx < len(self.mask_polygons):
                 self.mask_polygons[poly_idx].insert(insert_idx, (x, y))
                 self.tab.mask.setUnsaved(True)
                 self.updateMaskDisplay()
-                self.tab.mask.updateStatus(len(self.mask_polygons))
+                self._updateMaskStatus()
 
     def deleteMaskVertex(self, vertex_ref):
         """Delete a vertex from a polygon."""
@@ -6152,7 +6466,8 @@ class PlateTool(QtWidgets.QMainWindow):
             if len(self.mask_current_polygon) > 0:
                 del self.mask_current_polygon[idx]
                 self.updateMaskDisplay()
-                self.tab.mask.updateStatus(len(self.mask_polygons), len(self.mask_current_polygon))
+                self.tab.mask.updateStatus(len(self.mask_polygons), len(self.mask_current_polygon),
+                                           has_brush_strokes=self._hasBrushStrokes())
         else:
             poly_idx, vert_idx = vertex_ref
             if poly_idx < len(self.mask_polygons):
@@ -6162,13 +6477,13 @@ class PlateTool(QtWidgets.QMainWindow):
                     del polygon[vert_idx]
                     self.tab.mask.setUnsaved(True)
                     self.updateMaskDisplay()
-                    self.tab.mask.updateStatus(len(self.mask_polygons))
+                    self._updateMaskStatus()
                 else:
                     # Delete entire polygon if less than 3 vertices would remain
                     del self.mask_polygons[poly_idx]
                     self.tab.mask.setUnsaved(True)
                     self.updateMaskDisplay()
-                    self.tab.mask.updateStatus(len(self.mask_polygons))
+                    self._updateMaskStatus()
 
     def moveMaskVertex(self, vertex_ref, new_x, new_y):
         """Move a vertex to new position with edge snapping."""
@@ -6200,7 +6515,7 @@ class PlateTool(QtWidgets.QMainWindow):
                 self.tab.mask.setUnsaved(True)
 
         self.updateMaskDisplay()
-        self.tab.mask.updateStatus(len(self.mask_polygons))
+        self._updateMaskStatus()
 
     def updateMaskDisplay(self):
         """Update all mask graphics items."""
@@ -6249,31 +6564,56 @@ class PlateTool(QtWidgets.QMainWindow):
         self.updateMaskOverlayImage()
 
     def updateMaskOverlayImage(self):
-        """Update the mask overlay image based on polygons."""
+        """Rebuild the semi-transparent red overlay that shows the current mask.
+
+        The overlay array uses 1=masked (shown red) / 0=clear.
+        The paint layer is composited on top of the polygon fill, so
+        brush-erased holes (value=2) punch through solid polygon regions.
+        The array is transposed before passing to pyqtgraph because
+        img.data is stored (width, height) while numpy/OpenCV use (height, width).
+        """
         if not self.tab.mask.show_overlay.isChecked():
             self.mask_overlay.hide()
             return
 
-        if len(self.mask_polygons) == 0:
+        has_polygons = len(self.mask_polygons) > 0
+        has_paint = self._hasBrushStrokes()
+
+        if not has_polygons and not has_paint:
             self.mask_overlay.hide()
             return
 
-        # Skip if no image is loaded yet
         if self.img.data is None:
             return
 
-        # Get image dimensions - shape[0] is X, shape[1] is Y in this codebase
+        # shape[0]=X (width), shape[1]=Y (height) — codebase convention
         img_width = self.img.data.shape[0]
         img_height = self.img.data.shape[1]
 
-        # Create mask image (0 = clear, 1 = masked)
         mask_img = np.zeros((img_height, img_width), dtype=np.uint8)
 
+        # Fill polygon interiors
         for polygon in self.mask_polygons:
             pts = np.array(polygon, dtype=np.int32)
             cv2.fillPoly(mask_img, [pts], 1)
 
-        # Transpose for pyqtgraph display
+        # Composite brush paint layer on top
+        if self.mask_paint_layer is not None:
+            paint_layer = self.mask_paint_layer
+
+            # The paint layer may have been saved at a different resolution than the current image
+            #   (e.g. a mask carried over from a sensor with a different frame height). Resample it
+            #   (nearest-neighbour, to preserve the 0/1/2 labels) so loading doesn't crash.
+            if paint_layer.shape != mask_img.shape:
+                print("Mask paint layer {} != image {}; resampling to fit".format(
+                    paint_layer.shape, mask_img.shape))
+                paint_layer = cv2.resize(paint_layer, (img_width, img_height),
+                                         interpolation=cv2.INTER_NEAREST)
+
+            mask_img[paint_layer == 1] = 1   # painted → masked
+            mask_img[paint_layer == 2] = 0   # erased  → clear
+
+        # Transpose to (width, height) for pyqtgraph ImageItem
         self.mask_overlay.setImage(mask_img.T)
         self.mask_overlay.show()
 
@@ -6409,7 +6749,17 @@ class PlateTool(QtWidgets.QMainWindow):
                 self.calstar_markers_outer2.hide()
 
         elif old_index == mask_tab_index:
-            # Leaving mask tab - restore visibility based on user settings
+            # Leaving mask tab - disable brush/draw modes and restore settings
+            if self.mask_brush_mode:
+                self._exitBrushMode()
+            if self.mask_draw_mode:
+                if len(self.mask_current_polygon) >= 3:
+                    self.mask_polygons.append(self.mask_current_polygon.copy())
+                    self.tab.mask.setUnsaved(True)
+                self.mask_current_polygon = []
+                self.mask_draw_mode = False
+                self.tab.mask.setDrawMode(False)
+            self.spectral_type_text_list.setInteractionEnabled(True)
             self.img_frame.panning_enabled = True
 
             if self.catalog_stars_visible:
@@ -6441,15 +6791,41 @@ class PlateTool(QtWidgets.QMainWindow):
             self.img_frame.panning_enabled = True
 
     def generateMaskImage(self):
-        """Generate mask.bmp image from polygons."""
+        """Generate the mask.bmp array from polygons and the brush paint layer.
+
+        Output convention (matches RMS mask format):
+            255 = unmasked (pixel is used)
+              0 = masked   (pixel is ignored)
+
+        The paint layer is composited on top of the polygon fill so that
+        brush-erased pixels (value=2) can punch holes through solid polygons.
+        """
+        # shape[0]=X (width), shape[1]=Y (height) — codebase convention
         img_width = self.img.data.shape[0]
         img_height = self.img.data.shape[1]
 
+        # Start fully unmasked
         mask = np.full((img_height, img_width), 255, dtype=np.uint8)
 
+        # Burn in polygons (masked regions = 0)
         for polygon in self.mask_polygons:
             pts = np.array(polygon, dtype=np.int32)
             cv2.fillPoly(mask, [pts], 0)
+
+        # Composite brush paint layer on top:
+        #   paint pixels (1) → masked (0)
+        #   erase pixels  (2) → unmasked (255), overrides polygon fill
+        if self.mask_paint_layer is not None:
+            paint_layer = self.mask_paint_layer
+
+            # Resample if the paint layer was saved at a different resolution than the current image
+            #   (nearest-neighbour preserves the 0/1/2 labels), so a stale mask doesn't crash here.
+            if paint_layer.shape != mask.shape:
+                paint_layer = cv2.resize(paint_layer, (img_width, img_height),
+                                         interpolation=cv2.INTER_NEAREST)
+
+            mask[paint_layer == 1] = 0
+            mask[paint_layer == 2] = 255
 
         return mask
 
@@ -6470,7 +6846,7 @@ class PlateTool(QtWidgets.QMainWindow):
 
             # Mark as saved
             self.tab.mask.setUnsaved(False)
-            self.tab.mask.updateStatus(len(self.mask_polygons))
+            self._updateMaskStatus()
             self.updateFileManagerButton()
 
     def loadMaskDialog(self):
@@ -6486,7 +6862,13 @@ class PlateTool(QtWidgets.QMainWindow):
             self.loadMaskFromFile(file_path)
 
     def loadMaskFromFile(self, mask_path):
-        """Load mask.bmp and convert masked regions to editable polygons."""
+        """Load mask.bmp and convert masked regions to editable polygons.
+
+        Pixels that cannot be represented as clean polygon contours (e.g. prior
+        brush strokes, or boundary pixels lost to approxPolyDP simplification)
+        are captured in the paint layer so the full mask survives a round-trip
+        through save → load without any pixel loss.
+        """
         if not os.path.exists(mask_path):
             print(f"Mask file not found: {mask_path}")
             return
@@ -6498,34 +6880,56 @@ class PlateTool(QtWidgets.QMainWindow):
             print(f"Failed to load mask: {mask_path}")
             return
 
-        # Clear existing
         self.mask_polygons = []
         self.mask_current_polygon = []
 
-        # Find contours of masked (black) regions
+        # Find contours of masked (black, value=0) regions and convert to polygons.
+        # approxPolyDP reduces vertex count while keeping contour fidelity within epsilon.
         inverted = cv2.bitwise_not(mask_img)
         contours, _ = cv2.findContours(inverted, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Create polygon for each contour
         for contour in contours:
-            # Simplify to reduce points
             epsilon = 0.002 * cv2.arcLength(contour, True)
             approx = cv2.approxPolyDP(contour, epsilon, True)
-            # Convert to list of (x, y) tuples
             points = [(float(pt[0][0]), float(pt[0][1])) for pt in approx]
             if len(points) >= 3:
                 self.mask_polygons.append(points)
 
-        print(f"Loaded {len(self.mask_polygons)} polygon(s) from mask")
+        # Detect raster residuals: pixels that differ between the original mask
+        # and what the simplified polygons would reproduce.  These arise from
+        # prior brush strokes or from boundary pixels rounded away by approxPolyDP.
+        # They are stored in the paint layer so they are preserved on next save.
+        polygon_mask = np.full_like(mask_img, 255)
+        for polygon in self.mask_polygons:
+            pts = np.array(polygon, dtype=np.int32)
+            cv2.fillPoly(polygon_mask, [pts], 0)
+
+        img_height, img_width = mask_img.shape[:2]
+        paint_layer = np.zeros((img_height, img_width), dtype=np.uint8)
+
+        # Pixels masked in file but not covered by any polygon → paint (value=1)
+        paint_layer[(mask_img == 0) & (polygon_mask == 255)] = 1
+
+        # Pixels unmasked in file but inside a polygon → erase (value=2)
+        paint_layer[(mask_img == 255) & (polygon_mask == 0)] = 2
+
+        if np.any(paint_layer != 0):
+            self.mask_paint_layer = paint_layer
+            self.mask_brush_stroke_history = []
+            print(f"Loaded {len(self.mask_polygons)} polygon(s) + raster residuals from mask")
+        else:
+            self.mask_paint_layer = None
+            print(f"Loaded {len(self.mask_polygons)} polygon(s) from mask")
+
+        self.tab.mask.setUndoEnabled(False)
         self.updateMaskDisplay()
 
-        # Update self.mask so star detection uses the loaded mask
+        # Rebuild the MaskStructure used by star detection from the raw pixel data
         self.mask = MaskStructure(mask_img)
         print("Mask updated for star detection")
 
-        # Mark as saved (loaded mask is in sync)
         self.tab.mask.setUnsaved(False)
-        self.tab.mask.updateStatus(len(self.mask_polygons))
+        self._updateMaskStatus()
 
     ###################################################################################################
 
@@ -6732,7 +7136,33 @@ class PlateTool(QtWidgets.QMainWindow):
             self.distortion_center_marker2.setData(x=[x_centre], y=[y_centre])
 
 
-    def photometry(self, show_plot=False):
+    def screenPlotDPI(self):
+        """ Compute a matplotlib figure DPI scaled to the screen resolution so that the
+            astrometry and photometry plot windows (and their fonts, markers and lines) stay
+            legible on high-resolution displays. Scaling the DPI grows the whole figure
+            uniformly, leaving the layout unchanged. The 1080p screen height is the baseline
+            (scale = 1), and the scale is clamped so plots never shrink below the baseline nor
+            become unwieldy on very large screens.
+
+        Return:
+            [float] Figure DPI to use when creating the plot.
+        """
+
+        base_dpi = plt.rcParams['figure.dpi']
+
+        try:
+            screen_height = QtWidgets.QApplication.primaryScreen().geometry().height()
+            scale = screen_height/1080.0
+        except Exception:
+            scale = 1.0
+
+        # Keep the plots at least baseline size and cap the growth on very large screens
+        scale = max(1.0, min(scale, 2.5))
+
+        return base_dpi*scale
+
+
+    def photometry(self, show_plot=False, force_update=False):
         """
         Perform the photometry on selected stars. Updates residual text above and below picked stars
 
@@ -6842,11 +7272,29 @@ class PlateTool(QtWidgets.QMainWindow):
         # Set the fit weights so that everyting with SNR > 10 is weighted the maximum value
         weights = np.clip(snr_list, 0, 10)/10.0
 
+        # We need at least 3 stars for a robust photometry fit.
+        # Preferably, saturated and highly variable stars are excluded from the fit.
+        # First, let's compute the total number of stars and how many remain if we exclude both.
+        total_stars = len(saturation_list)
+        exclude_both = [sat or var for sat, var in zip(saturation_list, variable_star_list)]
+        good_stars_count = total_stars - sum(exclude_both)
+        
+        if good_stars_count >= 3:
+            # We have enough stars, exclude both saturated and variable stars
+            exclude_list = exclude_both
+        else:
+            # Not enough stars. Check if we have enough by only excluding saturated stars
+            non_saturated_count = total_stars - sum(saturation_list)
+            if non_saturated_count >= 3:
+                # Include variable stars in the fit, but still exclude saturated stars
+                exclude_list = saturation_list
+            else:
+                # Still not enough. We have to include all stars to ensure the fit works
+                exclude_list = [False] * total_stars
+
         # Fit the photometric offset (disable vignetting fit if a flat is used)
         # The fit is going to be weighted by the signal to noise ratio to reduce the influence of
         #  faint stars with large errors
-        # Saturated stars and highly variable stars are excluded from the fit
-        exclude_list = [sat or var for sat, var in zip(saturation_list, variable_star_list)]
         photom_params, self.photom_fit_stddev, self.photom_fit_resids = photometryFit(
             px_intens_list, radius_list, catalog_mags, fixed_vignetting=fixed_vignetting,
             weights=weights, exclude_list=exclude_list)
@@ -6858,6 +7306,14 @@ class PlateTool(QtWidgets.QMainWindow):
         self.platepar.mag_lev = photom_offset
         self.platepar.mag_lev_stddev = self.photom_fit_stddev
         self.platepar.vignetting_coeff = vignetting_coeff
+
+        # Fit the limiting magnitude model: log10(S/N) vs the calibrated (vignetting + extinction
+        # corrected) apparent magnitude. The predicted magnitude per star equals the catalog
+        # magnitude minus the fit residual. Saturated stars are excluded (their flux is capped).
+        predicted_mags = np.array(catalog_mags) - np.array(self.photom_fit_resids)
+        self.limiting_mag_info = limitingMagnitude(
+            predicted_mags, np.array(snr_list), snr_targets=(5, 10),
+            exclude_mask=np.array(saturation_list))
 
         # Update the values in the platepar tab in the GUI
         self.tab.param_manager.updatePlatepar()
@@ -6926,8 +7382,13 @@ class PlateTool(QtWidgets.QMainWindow):
 
             self.residual_text.update()
 
+        # Check if the photometry plot should be auto-updated
+        if (not show_plot) and (not force_update) and (self.fig_photometry is not None):
+            if plt.fignum_exists(self.fig_photometry.number):
+                force_update = True
+
         # Show the photometry fit plot
-        if show_plot:
+        if show_plot or force_update:
 
             # Check if figure already exists and is open - if so, close it (toggle off)
             if self.fig_photometry is not None:
@@ -6935,10 +7396,19 @@ class PlateTool(QtWidgets.QMainWindow):
                     if plt.fignum_exists(self.fig_photometry.number):
                         plt.close(self.fig_photometry)
                         self.fig_photometry = None
-                        return
+                        self.astrometry_plot_highlight_marker.hide()
+                        self.astrometry_plot_highlight_marker2.hide()
+                        self.astrometry_plot_highlight_marker_outer.hide()
+                        self.astrometry_plot_highlight_marker2_outer.hide()
+                        if not force_update:
+                            return
                 except:
                     pass
                 self.fig_photometry = None
+                self.astrometry_plot_highlight_marker.hide()
+                self.astrometry_plot_highlight_marker2.hide()
+                self.astrometry_plot_highlight_marker_outer.hide()
+                self.astrometry_plot_highlight_marker2_outer.hide()
 
             ### PLOT PHOTOMETRY FIT ###
             # Note: An almost identical code exists in Utils.CalibrationReport
@@ -6948,18 +7418,19 @@ class PlateTool(QtWidgets.QMainWindow):
             #                                    gridspec_kw={'height_ratios': [3, 1, 1]})
 
             # Init plot for photometry
-            self.fig_photometry = plt.figure(figsize=(10, 5))  # Adjust the figure size as needed
+            self.fig_photometry = plt.figure(figsize=(10, 5), dpi=self.screenPlotDPI())
             fig_p = self.fig_photometry
 
-            # Create a grid with 2 columns and 2 rows
-            gs = gridspec.GridSpec(2, 2, width_ratios=[1, 1], height_ratios=[1, 1])
+            # Create a grid with 2 columns and 3 rows
+            gs = gridspec.GridSpec(3, 2, width_ratios=[1, 1], height_ratios=[1, 1, 1])
 
-            # Large plot on the left
+            # Large plot on the left, spans all 3 rows
             ax_p = fig_p.add_subplot(gs[:, 0])
 
-            # Two smaller plots on the right, one on top of the other
+            # Three smaller plots on the right, stacked vertically
             ax_r = fig_p.add_subplot(gs[0, 1])
             ax_e = fig_p.add_subplot(gs[1, 1])
+            ax_m = fig_p.add_subplot(gs[2, 1])
 
             # Set photometry window title
             try:
@@ -6974,7 +7445,7 @@ class PlateTool(QtWidgets.QMainWindow):
             # Plot catalog magnitude vs. raw logsum of pixel intensities
             lsp_arr = np.log10(np.array(px_intens_list))
             ax_p.scatter(-2.5*lsp_arr, catalog_mags, s=5, c='r', zorder=3, alpha=0.5,
-                            label="Raw (extinction corrected)")
+                            label="Raw (extinction corrected)", picker=5)
 
             # Circle saturated stars in red empty circles
             saturation_label_set = False
@@ -7019,6 +7490,9 @@ class PlateTool(QtWidgets.QMainWindow):
             print()
             print('Photometric fit:')
             print(fit_info)
+            if self.limiting_mag_info is not None:
+                print('Limiting magnitude fit:')
+                print(self.limiting_mag_info['eqn_str'])
             print()
 
             # Plot the line fit
@@ -7053,7 +7527,7 @@ class PlateTool(QtWidgets.QMainWindow):
             img_diagonal = np.hypot(self.platepar.X_res/2, self.platepar.Y_res/2)
 
             # Plot radius from centre vs. fit residual (including vignetting)
-            ax_r.scatter(radius_list, self.photom_fit_resids, s=10, c='b', alpha=0.5, zorder=3)
+            ax_r.scatter(radius_list, self.photom_fit_resids, s=10, c='b', alpha=0.5, zorder=3, picker=5)
 
             # Plot a zero line
             ax_r.plot(np.linspace(0, img_diagonal, 10), np.zeros(10), linestyle='dashed', alpha=0.5,
@@ -7091,7 +7565,7 @@ class PlateTool(QtWidgets.QMainWindow):
             ### PLOT MAG DIFFERENCE BY ELEVATION
 
             # Plot elevation vs. fit residual
-            ax_e.scatter(elevation_list, self.photom_fit_resids, s=10, c='b', alpha=0.5, zorder=3)
+            ax_e.scatter(elevation_list, self.photom_fit_resids, s=10, c='b', alpha=0.5, zorder=3, picker=5)
 
             # Compute the fit residuals without extinction
             fit_resids_noext = \
@@ -7123,10 +7597,108 @@ class PlateTool(QtWidgets.QMainWindow):
             ax_e.set_ylabel("Fit res. (mag)")
             ax_e.set_xlabel("Elevation (deg)")
 
+            ### PLOT MAG DIFFERENCE BY CATALOG MAGNITUDE (gamma diagnostic)
+
+            catalog_mags_arr = np.array(catalog_mags)
+
+            # Plot catalog magnitude vs. fit residual, colored by SNR
+            snr_color = np.clip(snr_list, 0, 15)
+            sc_m = ax_m.scatter(catalog_mags_arr, self.photom_fit_resids, s=10, c=snr_color,
+                            cmap='viridis', vmin=0, vmax=15, alpha=0.7, zorder=3, picker=5)
+
+            # Add a colorbar for the SNR, with notches at the limiting-magnitude S/N targets
+            cbar_m = fig_p.colorbar(sc_m, ax=ax_m, ticks=[0, 5, 10, 15])
+            cbar_m.set_label("S/N")
+            for snr_notch in (5, 10):
+                cbar_m.ax.axhline(snr_notch, color='r', linewidth=1.2)
+
+            # Zero line
+            mag_min, mag_max = np.min(catalog_mags_arr), np.max(catalog_mags_arr)
+            ax_m.plot([mag_min, mag_max], [0, 0], linestyle='dashed', alpha=0.5, color='k')
+
+            # Draw the limiting magnitude at the target S/N values
+            if self.limiting_mag_info is not None:
+
+                # Colors set so the yellower line (higher S/N, brighter LM) is on the left and the
+                # greener line (lower S/N, fainter LM) is on the right
+                lm_colors = {5: 'green', 10: 'darkorange'}
+                for snr_target, lm_mag in self.limiting_mag_info['lm'].items():
+                    ax_m.axvline(lm_mag, linestyle='dashed', alpha=0.8,
+                                    color=lm_colors.get(snr_target, 'm'),
+                                    label="LM = {:.2f} mag @ S/N = {:g}".format(lm_mag, snr_target))
+
+                # Show the model equation so users can compute the LM for any S/N
+                ax_m.text(0.02, 0.03, self.limiting_mag_info['eqn_str'].split('\n')[0],
+                            transform=ax_m.transAxes, fontsize=7, va='bottom', ha='left',
+                            bbox=dict(boxstyle='round', fc='white', alpha=0.6, ec='none'))
+
+                ax_m.legend(fontsize=7, loc='upper right')
+
+            ax_m.grid()
+            ax_m.set_ylabel("Fit res. (mag)")
+            ax_m.set_xlabel("Catalog mag")
+
             ###
+
+            self.photometry_fit_x_list = [sc[0] for sc in star_coords]
+            self.photometry_fit_y_list = [sc[1] for sc in star_coords]
+
+            self.photometry_plot_highlight_artists = {
+                'ax_p': ax_p.plot([], [], 'ro', mfc='none', markersize=10, zorder=10)[0],
+                'ax_r': ax_r.plot([], [], 'ro', mfc='none', markersize=10, zorder=10)[0],
+                'ax_e': ax_e.plot([], [], 'ro', mfc='none', markersize=10, zorder=10)[0],
+                'ax_m': ax_m.plot([], [], 'ro', mfc='none', markersize=10, zorder=10)[0]
+            }
+
+            self.photometry_fit_data = {
+                'ax_p': (-2.5*lsp_arr, catalog_mags),
+                'ax_r': (radius_list, self.photom_fit_resids),
+                'ax_e': (elevation_list, self.photom_fit_resids),
+                'ax_m': (catalog_mags_arr.tolist(), self.photom_fit_resids),
+            }
+
+            fig_p.canvas.mpl_connect('pick_event', self.onPhotometryPlotPick)
 
             fig_p.tight_layout()
             fig_p.show()
+
+    def onPhotometryPlotPick(self, event):
+        """ Highlight a star in the main window when clicked in the photometry residuals plot. """
+        if event.mouseevent.button != 1:  # Left click only
+            return
+            
+        ind = event.ind
+        if len(ind) == 0:
+            return
+            
+        # Get the first picked index
+        star_idx = ind[0]
+        
+        if not hasattr(self, 'photometry_fit_x_list') or star_idx >= len(self.photometry_fit_x_list):
+            return
+            
+        img_x = self.photometry_fit_x_list[star_idx]
+        img_y = self.photometry_fit_y_list[star_idx]
+        
+        # Update the highlight markers (coordinates in pyqtgraph are x + 0.5, y + 0.5)
+        self.astrometry_plot_highlight_marker.setData(x=[img_x + 0.5], y=[img_y + 0.5])
+        self.astrometry_plot_highlight_marker2.setData(x=[img_x + 0.5], y=[img_y + 0.5])
+        self.astrometry_plot_highlight_marker_outer.setData(x=[img_x + 0.5], y=[img_y + 0.5])
+        self.astrometry_plot_highlight_marker2_outer.setData(x=[img_x + 0.5], y=[img_y + 0.5])
+        
+        # Ensure the markers are visible
+        self.astrometry_plot_highlight_marker.show()
+        self.astrometry_plot_highlight_marker2.show()
+        self.astrometry_plot_highlight_marker_outer.show()
+        self.astrometry_plot_highlight_marker2_outer.show()
+
+        # Update all matplotlib subplots to circle the star
+        if hasattr(self, 'photometry_fit_data') and hasattr(self, 'photometry_plot_highlight_artists'):
+            for key, (x_arr, y_arr) in self.photometry_fit_data.items():
+                if star_idx < len(x_arr) and star_idx < len(y_arr):
+                    self.photometry_plot_highlight_artists[key].set_data([x_arr[star_idx]], [y_arr[star_idx]])
+            if self.fig_photometry is not None:
+                self.fig_photometry.canvas.draw_idle()
 
 
     def fitBandRatio(self):
@@ -7835,6 +8407,58 @@ class PlateTool(QtWidgets.QMainWindow):
         return removed_count
 
 
+    def filterPositionalOutliers(self, sigma_threshold=3.0, abs_floor_px=3.0):
+        """
+        Remove paired stars whose image position is far from the catalog projection.
+
+        Run *after* a fit: re-projects each paired catalog star with the current platepar and drops
+        pairs whose positional residual is a gross outlier - typically a wrong or duplicate match
+        that survived NN/RANSAC and otherwise inflates the final RMSD. The threshold is robust
+        (median + sigma*MAD) and floored at abs_floor_px so a tight fit is never over-clipped.
+
+        Arguments:
+            sigma_threshold: [float] Robust-sigma multiplier for outlier detection.
+            abs_floor_px: [float] Minimum residual (px) to consider an outlier, protecting tight fits.
+
+        Returns:
+            int: Number of stars removed.
+        """
+        if len(self.paired_stars) < 15:
+            return 0
+
+        img_coords = np.array(self.paired_stars.imageCoords())
+        catalog_stars = np.array(self.paired_stars.skyCoords())
+        if len(catalog_stars) == 0:
+            return 0
+
+        jd = date2JD(*self.img_handle.currentTime())
+        cat_x, cat_y, _ = getCatalogStarsImagePositions(catalog_stars, jd, self.platepar)
+
+        errs = np.hypot(img_coords[:, 0] - cat_x, img_coords[:, 1] - cat_y)
+
+        # Robust threshold (MAD-based), floored so a clean fit isn't trimmed
+        med = np.median(errs)
+        mad = np.median(np.abs(errs - med))
+        robust_std = 1.4826*mad
+        thresh = max(abs_floor_px, med + sigma_threshold*robust_std)
+
+        outlier_indices = set(np.where(errs > thresh)[0].tolist())
+
+        if len(outlier_indices) > 0:
+            new_paired_stars = PairedStars()
+            for i, (x, y, fwhm, intens_acc, obj, snr, saturated) in enumerate(
+                    self.paired_stars.paired_stars):
+                if i not in outlier_indices:
+                    new_paired_stars.addPair(x, y, fwhm, intens_acc, obj, snr, saturated)
+            self.paired_stars = new_paired_stars
+
+        removed_count = len(outlier_indices)
+        if removed_count > 0:
+            print("Removed {} positional outliers (>{:.1f} px)".format(removed_count, thresh))
+
+        return removed_count
+
+
     def filterBlendedStars(self, fwhm_mult=2.0, mag_margin=0.3):
         """
         Filter paired_stars by removing likely blended stars.
@@ -8276,6 +8900,8 @@ class PlateTool(QtWidgets.QMainWindow):
             'label1', 'label2', 'label_f1', 'star_pick_info',
             # TextItemList objects
             'planet_labels', 'residual_text', 'spectral_type_text_list',
+            # Matplotlib objects
+            'fig_astrometry', 'plot_highlight_artists'
         ]
         for key in pyqtgraph_keys:
             if key in dic:
@@ -8283,7 +8909,7 @@ class PlateTool(QtWidgets.QMainWindow):
 
         # Remove other PlotCurveItem objects which cannot be pickled
         # Generic scrubber for pyqtgraph/qt items
-        unpicklable_modules = ('pyqtgraph', 'PyQt5', 'RMS.Routines.CustomPyqtgraphClasses')
+        unpicklable_modules = ('pyqtgraph', 'PyQt5', 'RMS.Routines.CustomPyqtgraphClasses', 'matplotlib')
         keys_to_remove = []
         for k, v in dic.items():
 
@@ -8297,6 +8923,15 @@ class PlateTool(QtWidgets.QMainWindow):
             if isinstance(v, list) and v:
                  # Check first item in list (heuristic)
                  first = v[0]
+                 if hasattr(first, '__class__') and hasattr(first.__class__, '__module__'):
+                      if first.__class__.__module__.startswith(unpicklable_modules):
+                          keys_to_remove.append(k)
+                          continue
+                          
+            # Check for dicts of objects
+            if isinstance(v, dict) and v:
+                 # Check first value in dict (heuristic)
+                 first = next(iter(v.values()))
                  if hasattr(first, '__class__') and hasattr(first.__class__, '__module__'):
                       if first.__class__.__module__.startswith(unpicklable_modules):
                           keys_to_remove.append(k)
@@ -8347,6 +8982,12 @@ class PlateTool(QtWidgets.QMainWindow):
         for k, v in variables.items():
             setattr(self, k, v)
         
+        # Init matplotlib figure references (stripped from saved state, not picklable)
+        if not hasattr(self, 'fig_astrometry'):
+            self.fig_astrometry = None
+        if not hasattr(self, 'fig_photometry'):
+            self.fig_photometry = None
+
         # Init catalog_stars_spectral_type if it doesn't exist (loading old state files)
         if not hasattr(self, 'catalog_stars_spectral_type'):
             self.catalog_stars_spectral_type = None
@@ -8664,6 +9305,32 @@ class PlateTool(QtWidgets.QMainWindow):
             self.updateMeasurementRefractionCorrection()
 
 
+        # Add the missing mask drawing/brush state variables (old states predate them)
+        if not hasattr(self, "mask_draw_mode"):
+            self.mask_draw_mode = False
+        if not hasattr(self, "mask_current_polygon"):
+            self.mask_current_polygon = []
+        if not hasattr(self, "mask_polygons"):
+            self.mask_polygons = []
+        if not hasattr(self, "mask_dragging_vertex"):
+            self.mask_dragging_vertex = None
+        if not hasattr(self, "mask_brush_mode"):
+            self.mask_brush_mode = False
+        if not hasattr(self, "mask_brush_radius"):
+            self.mask_brush_radius = 20
+        if not hasattr(self, "mask_brush_painting"):
+            self.mask_brush_painting = False
+        if not hasattr(self, "mask_brush_erasing"):
+            self.mask_brush_erasing = False
+        if not hasattr(self, "mask_brush_last_pos"):
+            self.mask_brush_last_pos = None
+        if not hasattr(self, "mask_paint_layer"):
+            self.mask_paint_layer = None
+        if not hasattr(self, "mask_brush_stroke_history"):
+            self.mask_brush_stroke_history = []
+        if not hasattr(self, "mask_brush_max_undo"):
+            self.mask_brush_max_undo = 50
+
         # If setupUI hasn't already been called, call it
         if not hasattr(self, 'central'):
 
@@ -8766,8 +9433,19 @@ class PlateTool(QtWidgets.QMainWindow):
 
     def handleMouseRelease(self, button, scene_x, scene_y):
         """Handle mouse release for star picking (called from eventFilter)."""
-        # Stop mask vertex dragging
         self.mask_dragging_vertex = None
+
+        if self.mask_brush_painting:
+            self.mask_brush_painting = False
+            self.mask_brush_erasing = False
+            self.mask_brush_last_pos = None
+            self._updateMaskStatus()
+            self.press_scene_x = None
+            self.press_scene_y = None
+            self.press_button = None
+            self.press_modifiers = None
+            self.clicked = 0
+            return
 
         # Check if this was a click (not a drag) for star picking
         if self.press_scene_x is not None and self.star_pick_mode:
@@ -8792,10 +9470,19 @@ class PlateTool(QtWidgets.QMainWindow):
         self.clicked = 0
 
     def onMouseReleased(self, event):
-        # Note: This may not be called during panning - handleMouseRelease via eventFilter is the main handler
-        # Keep this for non-panning scenarios and mask vertex dragging
         self.mask_dragging_vertex = None
 
+        if self.mask_brush_painting:
+            self.mask_brush_painting = False
+            self.mask_brush_erasing = False
+            self.mask_brush_last_pos = None
+            self.press_scene_x = None
+            self.press_scene_y = None
+            self.press_button = None
+            self.press_modifiers = None
+            self.clicked = 0
+            self._updateMaskStatus()
+            return
 
     def handleStarPick(self, button, modifiers):
         """Handle star picking on click (not drag). Called from onMouseReleased."""
@@ -8933,6 +9620,11 @@ class PlateTool(QtWidgets.QMainWindow):
                     # Remove the closest picked star from the list
                     self.paired_stars.removeClosestPair(self.mouse_x, self.mouse_y)
 
+                    self.astrometry_plot_highlight_marker.hide()
+                    self.astrometry_plot_highlight_marker2.hide()
+                    self.astrometry_plot_highlight_marker_outer.hide()
+                    self.astrometry_plot_highlight_marker2_outer.hide()
+
                     self.updatePairedStars()
                     self.updateFitResiduals()
                     self.photometry()
@@ -9009,6 +9701,12 @@ class PlateTool(QtWidgets.QMainWindow):
             # Handle mask vertex dragging
             if self.mask_dragging_vertex is not None:
                 self.moveMaskVertex(self.mask_dragging_vertex, mp.x() - 0.5, mp.y() - 0.5)
+
+            if self.mask_brush_mode:
+                self.brush_cursor.setCenter(mp)
+
+            if self.mask_brush_painting:
+                self.brushPaintAt(mp.x() - 0.5, mp.y() - 0.5)
 
             self.zoom()
 
@@ -9087,33 +9785,43 @@ class PlateTool(QtWidgets.QMainWindow):
         self.press_button = event.button()
         self.press_modifiers = modifiers
 
-        # Handle mask drawing/editing
+        # Handle brush painting
+        if self.mask_brush_mode:
+            pos = event.scenePos()
+            mp = self.img_frame.mapSceneToView(pos)
+            click_x, click_y = mp.x() - 0.5, mp.y() - 0.5
+
+            if event.button() in (QtCore.Qt.LeftButton, QtCore.Qt.RightButton):
+                self.mask_brush_erasing = (event.button() == QtCore.Qt.RightButton)
+                self.mask_brush_painting = True
+                self.mask_brush_last_pos = None
+                self.brushStrokeBegin()
+                self.brushPaintAt(click_x, click_y)
+                self.tab.mask.setUnsaved(True)
+                return
+
+        # Handle mask polygon drawing/editing
         if self.mask_draw_mode or len(self.mask_polygons) > 0 or len(self.mask_current_polygon) > 0:
             pos = event.scenePos()
             mp = self.img_frame.mapSceneToView(pos)
             click_x, click_y = mp.x() - 0.5, mp.y() - 0.5
 
-            # Check if clicking near an existing vertex
             vertex_hit = self.findNearestMaskVertex(click_x, click_y, threshold=15)
 
             if event.button() == QtCore.Qt.LeftButton:
                 if vertex_hit is not None:
-                    # Start dragging this vertex
                     self.mask_dragging_vertex = vertex_hit
                     return
                 elif modifiers & QtCore.Qt.ControlModifier:
-                    # CTRL+click: insert vertex on nearest edge
                     edge_hit = self.findNearestMaskEdge(click_x, click_y, threshold=15)
                     if edge_hit is not None:
                         self.insertMaskVertex(edge_hit, click_x, click_y)
                         return
                 elif self.mask_draw_mode:
-                    # Add new point
                     self.addMaskPoint(click_x, click_y)
                     return
             elif event.button() == QtCore.Qt.RightButton:
                 if vertex_hit is not None:
-                    # Delete this vertex
                     self.deleteMaskVertex(vertex_hit)
                     return
 
@@ -9133,6 +9841,13 @@ class PlateTool(QtWidgets.QMainWindow):
                 if modifiers == QtCore.Qt.NoModifier:
                     self.closeMaskPolygon()
                     return
+
+        # Handle brush undo - Ctrl+Z when on mask tab
+        if event.key() == QtCore.Qt.Key_Z and (modifiers == QtCore.Qt.ControlModifier):
+            mask_tab_index = self.tab.indexOf(self.tab.mask)
+            if self.tab.currentIndex() == mask_tab_index and self.mask_brush_stroke_history:
+                self.undoBrushStroke()
+                return
 
         # When no data is loaded, block all key actions
         if not self.hasData():
@@ -10644,8 +11359,22 @@ class PlateTool(QtWidgets.QMainWindow):
         # Handle scroll events
         if self.img_frame.sceneBoundingRect().contains(event.pos()):
 
+            # Brush mode + Shift: scroll changes brush size; bare scroll falls through to zoom
+            if self.mask_brush_mode and (modifier & QtCore.Qt.ShiftModifier):
+                step = max(1, self.mask_brush_radius // 10)
+                if delta > 0:
+                    self.mask_brush_radius = min(200, self.mask_brush_radius + step)
+                elif delta < 0:
+                    self.mask_brush_radius = max(1, self.mask_brush_radius - step)
+                self.brush_cursor.setRadius(self.mask_brush_radius)
+                self.tab.mask.brush_size_slider.blockSignals(True)
+                self.tab.mask.brush_size_slider.setValue(self.mask_brush_radius)
+                self.tab.mask.brush_size_value.setText(str(self.mask_brush_radius))
+                self.tab.mask.brush_size_slider.blockSignals(False)
+                return
+
             # If control is pressed in star picking mode, change the size of the aperture
-            if (modifier & QtCore.Qt.ControlModifier) and self.star_pick_mode:
+            elif (modifier & QtCore.Qt.ControlModifier) and self.star_pick_mode:
 
                 # Increase aperture size
                 if delta < 0:
@@ -10904,7 +11633,7 @@ class PlateTool(QtWidgets.QMainWindow):
             self.cat_star_markers.hide()
             self.cat_star_markers2.hide()
             self.geo_markers.hide()
-            self.geo_markers.hide()
+            self.geo_markers2.hide()
             # Hide planets
             self.planet_markers.hide()
             self.planet_markers2.hide()
@@ -10914,7 +11643,7 @@ class PlateTool(QtWidgets.QMainWindow):
             self.cat_star_markers.show()
             self.cat_star_markers2.show()
             self.geo_markers.show()
-            self.geo_markers.show()
+            self.geo_markers2.show()
             # Show planets
             self.planet_markers.show()
             self.planet_markers2.show()
@@ -11374,6 +12103,17 @@ class PlateTool(QtWidgets.QMainWindow):
         catalog_stars_filtered, _ = self.filterCatalogStarsByMask(
             catalog_x_filtered, catalog_y_filtered, catalog_stars_filtered)
 
+        # Cap the catalog fed to NN matching to the brightest stars. Guards against a mis-inferred
+        #   over-deep catalog LM (e.g. a wide FOV at LM 10 -> 100k+ stars) bogging down the fit. The
+        #   detected stars are the brightest in the image, so the brightest catalog stars are the
+        #   matchable ones; cause-agnostic (works regardless of why the LM came out deep).
+        nn_catalog_cap = 8000
+        if len(catalog_stars_filtered) > nn_catalog_cap:
+            print("  Capping catalog from {:d} to brightest {:d} stars for NN fit".format(
+                len(catalog_stars_filtered), nn_catalog_cap))
+            brightest_idx = np.argsort(catalog_stars_filtered[:, 2])[:nn_catalog_cap]
+            catalog_stars_filtered = catalog_stars_filtered[brightest_idx]
+
         if pointing_only:
             # --- Pointing-only mode: use recalibrateFF (same as night processing) ---
             print()
@@ -11555,6 +12295,13 @@ class PlateTool(QtWidgets.QMainWindow):
             else:
                 print("Final refinement with user settings (distortion={})...".format(user_distortion_type))
             self.fitPickedStars()
+
+            # Sigma-clip gross positional mispairs that survived NN/RANSAC (a detection matched to a
+            #   wrong/duplicate catalog star inflates the RMSD), then refit once on the clean set.
+            removed = self.filterPositionalOutliers(sigma_threshold=3.0, abs_floor_px=3.0)
+            if removed > 0:
+                print("Pairs after positional filtering: {}".format(len(self.paired_stars)))
+                self.fitPickedStars()
 
         # Restore fit_only_pointing after pointing-only fit
         self.fit_only_pointing = user_fit_only_pointing
@@ -12513,6 +13260,12 @@ class PlateTool(QtWidgets.QMainWindow):
             self.first_platepar_fit = True
             self.fitPickedStars()
 
+            # Sigma-clip gross positional mispairs that survived NN/RANSAC, then refit once
+            removed = self.filterPositionalOutliers(sigma_threshold=3.0, abs_floor_px=3.0)
+            if removed > 0:
+                print("Pairs after positional filtering: {}".format(len(self.paired_stars)))
+                self.fitPickedStars()
+
             # Note: catalog LM restoration is handled by the caller (autoFitAstrometryNet)
 
             # Update the display
@@ -12667,7 +13420,11 @@ class PlateTool(QtWidgets.QMainWindow):
             else:
 
                 print("The CALSTARS file is missing, trying to generate it automatically...")
-                calstars_list = extractStarsAndSave(self.config, self.dir_path)
+                try:
+                    calstars_list = extractStarsAndSave(self.config, self.dir_path)
+                except Exception as e:
+                    print("ERROR: Star extraction failed: {:s}".format(str(e)))
+                    calstars_list = []
 
 
         else:
@@ -13509,7 +14266,8 @@ class PlateTool(QtWidgets.QMainWindow):
             img_crop_orig = self.img.data[x_min:x_max, y_min:y_max]
 
         # Perform gamma correction
-        img_crop = gammaCorrectionImage(img_crop_orig, self.config.gamma, out_type=np.float32)
+        img_crop = gammaCorrectionImage(img_crop_orig, self.config.gamma,
+                                        bp=0, wp=(2**self.config.bit_depth - 1), out_type=np.float32)
 
 
         ######################################################################################################
@@ -14129,6 +14887,15 @@ class PlateTool(QtWidgets.QMainWindow):
         # Restore button state
         self.tab.param_manager.setFitButtonBusy(False)
 
+        self.astrometry_plot_highlight_marker.hide()
+        self.astrometry_plot_highlight_marker2.hide()
+        self.astrometry_plot_highlight_marker_outer.hide()
+        self.astrometry_plot_highlight_marker2_outer.hide()
+
+        # Auto-update astrometry fit plots if already open
+        if self.fig_astrometry is not None and plt.fignum_exists(self.fig_astrometry.number):
+            self.showAstrometryFitPlots(force_update=True)
+
 
     def jumpNextStar(self, miss_this_one=False):
 
@@ -14144,7 +14911,7 @@ class PlateTool(QtWidgets.QMainWindow):
         self.updateLeftLabels()
         self.updateStars()
 
-    def showAstrometryFitPlots(self):
+    def showAstrometryFitPlots(self, force_update=False):
         """ Show window with astrometry fit details. Toggle on/off if already open. """
 
         # Check if figure already exists and is open - if so, close it (toggle off)
@@ -14153,10 +14920,19 @@ class PlateTool(QtWidgets.QMainWindow):
                 if plt.fignum_exists(self.fig_astrometry.number):
                     plt.close(self.fig_astrometry)
                     self.fig_astrometry = None
-                    return
+                    self.astrometry_plot_highlight_marker.hide()
+                    self.astrometry_plot_highlight_marker2.hide()
+                    self.astrometry_plot_highlight_marker_outer.hide()
+                    self.astrometry_plot_highlight_marker2_outer.hide()
+                    if not force_update:
+                        return
             except:
                 pass
             self.fig_astrometry = None
+            self.astrometry_plot_highlight_marker.hide()
+            self.astrometry_plot_highlight_marker2.hide()
+            self.astrometry_plot_highlight_marker_outer.hide()
+            self.astrometry_plot_highlight_marker2_outer.hide()
 
         # Extract paired catalog stars and image coordinates separately (with SNR and saturation)
         all_coords = list(self.paired_stars.allCoords())
@@ -14262,7 +15038,7 @@ class PlateTool(QtWidgets.QMainWindow):
             (ax_azim, ax_elev, ax_skyradius),
             (ax_x, ax_y, ax_radius),
             (ax_snr, ax_mag, ax_fwhm)
-        ) = plt.subplots(ncols=3, nrows=3, facecolor=None, figsize=(12, 9))
+        ) = plt.subplots(ncols=3, nrows=3, facecolor=None, figsize=(12, 9), dpi=self.screenPlotDPI())
         fig_a = self.fig_astrometry
 
         # Set figure title
@@ -14279,14 +15055,14 @@ class PlateTool(QtWidgets.QMainWindow):
             print("Failed to set the window title!")
 
         # Plot azimuth vs azimuth error
-        ax_azim.scatter(azim_list, 60*np.array(azim_residuals), s=2, c='k', zorder=3)
+        ax_azim.scatter(azim_list, 60*np.array(azim_residuals), s=2, c='k', zorder=3, picker=5)
 
         ax_azim.grid()
         ax_azim.set_xlabel("Azimuth (deg, +E of due N)")
         ax_azim.set_ylabel("Azimuth error (arcmin)")
 
         # Plot elevation vs elevation error
-        ax_elev.scatter(elev_list, 60*np.array(elev_residuals), s=2, c='k', zorder=3)
+        ax_elev.scatter(elev_list, 60*np.array(elev_residuals), s=2, c='k', zorder=3, picker=5)
 
         ax_elev.grid()
         ax_elev.set_xlabel("Elevation (deg)")
@@ -14298,7 +15074,7 @@ class PlateTool(QtWidgets.QMainWindow):
             ax_elev.set_xlim([0, 90])
 
         # Plot sky radius vs radius error
-        ax_skyradius.scatter(skyradius_list, 60*np.array(skyradius_residuals), s=2, c='k', zorder=3)
+        ax_skyradius.scatter(skyradius_list, 60*np.array(skyradius_residuals), s=2, c='k', zorder=3, picker=5)
 
         ax_skyradius.grid()
         ax_skyradius.set_xlabel("Radius from centre (deg)")
@@ -14331,7 +15107,7 @@ class PlateTool(QtWidgets.QMainWindow):
         ax_skyradius.set_ylim([-max_ylim, max_ylim])
 
         # Plot X vs X error
-        ax_x.scatter(x_list, x_residuals, s=2, c='k', zorder=3)
+        ax_x.scatter(x_list, x_residuals, s=2, c='k', zorder=3, picker=5)
 
         ax_x.grid()
         ax_x.set_xlabel("X (px)")
@@ -14339,7 +15115,7 @@ class PlateTool(QtWidgets.QMainWindow):
         ax_x.set_xlim([0, self.platepar.X_res])
 
         # Plot Y vs Y error
-        ax_y.scatter(y_list, y_residuals, s=2, c='k', zorder=3)
+        ax_y.scatter(y_list, y_residuals, s=2, c='k', zorder=3, picker=5)
 
         ax_y.grid()
         ax_y.set_xlabel("Y (px)")
@@ -14347,7 +15123,7 @@ class PlateTool(QtWidgets.QMainWindow):
         ax_y.set_xlim([0, self.platepar.Y_res])
 
         # Plot radius vs radius error
-        ax_radius.scatter(radius_list, radius_residuals, s=2, c='k', zorder=3)
+        ax_radius.scatter(radius_list, radius_residuals, s=2, c='k', zorder=3, picker=5)
 
         ax_radius.grid()
         ax_radius.set_xlabel("Radius (px)")
@@ -14355,7 +15131,7 @@ class PlateTool(QtWidgets.QMainWindow):
         ax_radius.set_xlim([0, np.hypot(self.platepar.X_res/2, self.platepar.Y_res/2)])
 
         # Plot error vs SNR
-        ax_snr.scatter(snr_list, total_error_px, s=2, c='k', zorder=3)
+        ax_snr.scatter(snr_list, total_error_px, s=2, c='k', zorder=3, picker=5)
 
         ax_snr.grid(alpha=0.3)
         ax_snr.set_xlabel("S/N")
@@ -14390,12 +15166,15 @@ class PlateTool(QtWidgets.QMainWindow):
         sat_arr = np.array(saturated_list)
         err_arr = np.array(total_error_px)
 
-        # Plot non-saturated stars in black
+        # Plot all stars for picking, using colors based on saturation
+        color_arr = np.where(sat_arr, 'r', 'k')
+        ax_mag.scatter(mag_arr, err_arr, s=2, c=color_arr, zorder=3, picker=5)
+
+        # Plot proxy artists for legend
         if np.sum(~sat_arr) > 0:
-            ax_mag.scatter(mag_arr[~sat_arr], err_arr[~sat_arr], s=2, c='k', zorder=3, label='Normal')
-        # Plot saturated stars in red
+            ax_mag.scatter([], [], s=2, c='k', label='Normal')
         if np.sum(sat_arr) > 0:
-            ax_mag.scatter(mag_arr[sat_arr], err_arr[sat_arr], s=2, c='r', zorder=4, label='Saturated')
+            ax_mag.scatter([], [], s=2, c='r', label='Saturated')
             ax_mag.legend(loc='upper right', fontsize=8, markerscale=3)
 
         ax_mag.grid()
@@ -14406,14 +15185,15 @@ class PlateTool(QtWidgets.QMainWindow):
         # Plot error vs FWHM
         fwhm_arr = np.array(fwhm_list)
         valid_fwhm = fwhm_arr > 0  # Filter out invalid FWHM values
-        if np.sum(valid_fwhm) > 0:
-            ax_fwhm.scatter(fwhm_arr[valid_fwhm], err_arr[valid_fwhm], s=2, c='k', zorder=3)
+        fwhm_arr[~valid_fwhm] = np.nan
+        
+        ax_fwhm.scatter(fwhm_arr, err_arr, s=2, c='k', zorder=3, picker=5)
 
         ax_fwhm.grid()
         ax_fwhm.set_xlabel("FWHM (px)")
         ax_fwhm.set_ylabel("Error (px)")
         if np.sum(valid_fwhm) > 0:
-            ax_fwhm.set_xlim([0, np.max(fwhm_arr[valid_fwhm]) * 1.1])
+            ax_fwhm.set_xlim([0, np.nanmax(fwhm_arr) * 1.1])
 
         # Equalize Y limits, make them integers, and set a minimum range of 1 px
         x_max_ylim = np.max(np.abs(ax_x.get_ylim()))
@@ -14430,8 +15210,75 @@ class PlateTool(QtWidgets.QMainWindow):
         ax_mag.set_ylim([0, max_ylim_px])
         ax_fwhm.set_ylim([0, max_ylim_px])
 
+        self.astrometry_fit_x_list = x_list
+        self.astrometry_fit_y_list = y_list
+        
+        self.plot_highlight_artists = {
+            'azim': ax_azim.plot([], [], 'ro', mfc='none', markersize=10, zorder=10)[0],
+            'elev': ax_elev.plot([], [], 'ro', mfc='none', markersize=10, zorder=10)[0],
+            'skyradius': ax_skyradius.plot([], [], 'ro', mfc='none', markersize=10, zorder=10)[0],
+            'x': ax_x.plot([], [], 'ro', mfc='none', markersize=10, zorder=10)[0],
+            'y': ax_y.plot([], [], 'ro', mfc='none', markersize=10, zorder=10)[0],
+            'radius': ax_radius.plot([], [], 'ro', mfc='none', markersize=10, zorder=10)[0],
+            'snr': ax_snr.plot([], [], 'ro', mfc='none', markersize=10, zorder=10)[0],
+            'mag': ax_mag.plot([], [], 'ro', mfc='none', markersize=10, zorder=10)[0],
+            'fwhm': ax_fwhm.plot([], [], 'ro', mfc='none', markersize=10, zorder=10)[0]
+        }
+        
+        self.astrometry_fit_data = {
+            'azim': (azim_list, 60*np.array(azim_residuals)),
+            'elev': (elev_list, 60*np.array(elev_residuals)),
+            'skyradius': (skyradius_list, 60*np.array(skyradius_residuals)),
+            'x': (x_list, x_residuals),
+            'y': (y_list, y_residuals),
+            'radius': (radius_list, radius_residuals),
+            'snr': (snr_list, total_error_px),
+            'mag': (mag_arr, err_arr),
+            'fwhm': (fwhm_arr, err_arr)
+        }
+
+        fig_a.canvas.mpl_connect('pick_event', self.onAstrometryPlotPick)
+
         fig_a.tight_layout()
         fig_a.show()
+
+    def onAstrometryPlotPick(self, event):
+        """ Highlight a star in the main window when clicked in the astrometry residuals plot. """
+        if event.mouseevent.button != 1:  # Left click only
+            return
+            
+        ind = event.ind
+        if len(ind) == 0:
+            return
+            
+        # Get the first picked index
+        star_idx = ind[0]
+        
+        if not hasattr(self, 'astrometry_fit_x_list') or star_idx >= len(self.astrometry_fit_x_list):
+            return
+            
+        img_x = self.astrometry_fit_x_list[star_idx]
+        img_y = self.astrometry_fit_y_list[star_idx]
+        
+        # Update the highlight markers (coordinates in pyqtgraph are x + 0.5, y + 0.5)
+        self.astrometry_plot_highlight_marker.setData(x=[img_x + 0.5], y=[img_y + 0.5])
+        self.astrometry_plot_highlight_marker2.setData(x=[img_x + 0.5], y=[img_y + 0.5])
+        self.astrometry_plot_highlight_marker_outer.setData(x=[img_x + 0.5], y=[img_y + 0.5])
+        self.astrometry_plot_highlight_marker2_outer.setData(x=[img_x + 0.5], y=[img_y + 0.5])
+        
+        # Ensure the markers are visible
+        self.astrometry_plot_highlight_marker.show()
+        self.astrometry_plot_highlight_marker2.show()
+        self.astrometry_plot_highlight_marker_outer.show()
+        self.astrometry_plot_highlight_marker2_outer.show()
+
+        # Update all matplotlib subplots to circle the star
+        if hasattr(self, 'astrometry_fit_data') and hasattr(self, 'plot_highlight_artists'):
+            for key, (x_arr, y_arr) in self.astrometry_fit_data.items():
+                if star_idx < len(x_arr) and star_idx < len(y_arr):
+                    self.plot_highlight_artists[key].set_data([x_arr[star_idx]], [y_arr[star_idx]])
+            if self.fig_astrometry is not None:
+                self.fig_astrometry.canvas.draw_idle()
 
 
     def computeIntensitySum(self, star_mask_coeff=3):
