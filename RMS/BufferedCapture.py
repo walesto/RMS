@@ -1782,12 +1782,15 @@ class BufferedCapture(Process):
 
             log.debug("Process-specific initialization complete")
 
-            # Prevent GStreamer and other grandchild processes from inheriting the
-            # large shared frame buffers (~506 MB each at 1080p). These buffers are
-            # only needed by BufferedCapture and Compressor; any subprocess forked
-            # from here (e.g. GStreamer NVENC encoder, RawFrameSaver) does not need
-            # them. MADV_DONTFORK tells the kernel to exclude these pages from any
-            # child created via fork(), so grandchildren never see them at all.
+            # Keep the large shared frame buffers (~506 MB each at 1080p) out of the
+            # address space of grandchild processes. These buffers are only needed by
+            # BufferedCapture and Compressor; any subprocess forked from here (e.g.
+            # GStreamer NVENC encoder, RawFrameSaver) does not need them. MADV_DONTFORK
+            # tells the kernel to exclude these pages from any child created via fork(),
+            # so grandchildren never get the mapping at all. Because these are MAP_SHARED
+            # mappings, a grandchild would not duplicate the physical pages, but excluding
+            # the VMAs still avoids inflating the grandchild's RSS / OOM score if it ever
+            # faults them in, and keeps its address space clean.
             # Compressor is unaffected because it forks from StartCapture, not here.
             try:
                 _libc = ctypes.CDLL('libc.so.6', use_errno=True)
@@ -2233,16 +2236,30 @@ class BufferedCapture(Process):
                             # If transitioning to daytime, release the compression frame
                             # buffers back to the OS. They are not used during the day
                             # (frame writes are skipped in daytime mode) and would otherwise
-                            # sit in swap until nightfall. MADV_DONTNEED drops the pages
-                            # immediately; they get zero-filled on next write at no cost.
+                            # sit in swap until nightfall.
+                            #
+                            # These buffers are multiprocessing.Array, which on Linux is a
+                            # tmpfs-file-backed MAP_SHARED mapping. MADV_DONTNEED only drops
+                            # the calling process's page-table entries for such a mapping; the
+                            # underlying tmpfs pages are NOT freed (they stay resident / in
+                            # swap). MADV_REMOVE punches a hole in the backing tmpfs file,
+                            # which actually frees the physical pages. We try MADV_REMOVE
+                            # first and fall back to MADV_DONTNEED on filesystems that don't
+                            # support hole-punching. Pages re-fault from the (now zeroed)
+                            # backing store on next write, at no cost.
                             if current_daytime:
                                 try:
                                     _libc = ctypes.CDLL('libc.so.6', use_errno=True)
                                     _libc.madvise.restype = ctypes.c_int
                                     _libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
                                     MADV_DONTNEED = 4
+                                    MADV_REMOVE = 9
                                     for arr in (self.array1, self.array2):
-                                        _libc.madvise(arr.ctypes.data, arr.nbytes, MADV_DONTNEED)
+                                        ret = _libc.madvise(arr.ctypes.data, arr.nbytes, MADV_REMOVE)
+                                        if ret != 0:
+                                            # MADV_REMOVE unsupported here (e.g. EOPNOTSUPP);
+                                            # fall back to dropping our page-table entries.
+                                            _libc.madvise(arr.ctypes.data, arr.nbytes, MADV_DONTNEED)
                                     log.info("Released compression frame buffers ({:.0f} MB) back to OS".format(
                                         sum(a.nbytes for a in (self.array1, self.array2)) / (1024*1024)))
                                 except Exception as e:
@@ -2254,8 +2271,9 @@ class BufferedCapture(Process):
                         self.last_daytime_mode = current_daytime
 
                         # Calculate buffer fill percentage based on max frame age
-                        # The appsink has max-buffers=100, so at fps rate, max capacity is ~100/fps seconds
-                        max_buffer_time = 100.0 / self.config.fps  # Theoretical max buffer time in seconds
+                        # The appsink has max-buffers=gst_queue_size, so at fps rate, max
+                        # capacity is ~gst_queue_size/fps seconds
+                        max_buffer_time = float(self.config.gst_queue_size) / self.config.fps  # Theoretical max buffer time in seconds
                         buffer_fill_percent = min(100, (max_frame_age_seconds / max_buffer_time) * 100)
 
                         # Calculate dropped frames in last 10 minutes

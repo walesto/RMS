@@ -1166,7 +1166,9 @@ def parseCapture(config, parser):
         config.gst_decoder = parser.get(section, "gst_decoder")
 
     if parser.has_option(section, "gst_queue_size"):
-        config.gst_queue_size = parser.getint(section, "gst_queue_size")
+        # Clamp to >= 1: in GStreamer max-size-buffers=0 means *unlimited*, which would
+        # defeat the purpose of this setting and risk OOM.
+        config.gst_queue_size = max(1, parser.getint(section, "gst_queue_size"))
 
     if parser.has_option(section, "camera_settings_path") and os.path.isfile(parser.get(section, "camera_settings_path")):
         config.camera_settings_path = parser.get(section, "camera_settings_path")
