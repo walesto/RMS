@@ -93,23 +93,62 @@ regex_for() {
 #  should_reboot() – check if system reboot is requested
 # ------------------------------------------------------------
 should_reboot() {
+    # Reset the kernel target; only the kernel-mismatch path below sets it.
+    REBOOT_KERNEL_TARGET=""
+
     if [[ "$REBOOT_MODE" == "always" ]]; then
         return 0
     elif [[ "$REBOOT_MODE" == "if-needed" ]]; then
-        # Ubuntu/Debian: flag file created by update-notifier-common or linux-base ≥4.13
+        # Ubuntu/Debian: flag file created by update-notifier-common or linux-base ≥4.13.
+        # This is the reliable signal: it lives on tmpfs (/run) and is cleared on reboot,
+        # so it can never cause a reboot loop.
         if [[ -f /var/run/reboot-required ]]; then
             return 0
         fi
-        # Fallback: compare running kernel to latest installed (works on RPi OS / Debian)
-        local running latest
+        # Fallback: compare running kernel to latest installed (works on RPi OS / Debian).
+        local running latest last_target
         running="$(uname -r)"
         latest="$(ls /lib/modules/ | sort -V | tail -1)"
         if [[ -n "$latest" && "$running" != "$latest" ]]; then
+            # Loop guard: if the latest installed kernel never becomes the running one
+            # (unbootable kernel, bootloader pinned to an older version, RPi
+            # firmware/modules mismatch), an unattended cron run would otherwise reboot
+            # on every invocation. We stamp the kernel we last rebooted for (in
+            # do_reboot, i.e. only when a reboot is actually issued) and refuse to
+            # reboot again for the same target.
+            last_target=""
+            [[ -f "$REBOOT_STAMP_FILE" ]] && last_target="$(cat "$REBOOT_STAMP_FILE" 2>/dev/null || true)"
+            if [[ "$last_target" == "$latest" ]]; then
+                log_message "Kernel mismatch (running $running, installed $latest) but a reboot was already attempted for this kernel - skipping to avoid a reboot loop"
+                return 1
+            fi
             log_message "Kernel mismatch: running $running, installed $latest"
+            REBOOT_KERNEL_TARGET="$latest"
             return 0
         fi
     fi
     return 1
+}
+
+# ------------------------------------------------------------
+#  reboot_available() – true if passwordless `sudo shutdown` works
+# ------------------------------------------------------------
+reboot_available() {
+    sudo -n shutdown --help >/dev/null 2>&1
+}
+
+# ------------------------------------------------------------
+#  do_reboot() – record the kernel loop-guard stamp (if any) and reboot.
+#  Stamping here (not in should_reboot) means we only suppress future
+#  reboots for kernels we actually attempted, so enabling sudo later still
+#  allows the pending reboot to proceed. Returns the status of shutdown.
+# ------------------------------------------------------------
+do_reboot() {
+    if [[ -n "${REBOOT_KERNEL_TARGET:-}" ]]; then
+        echo "$REBOOT_KERNEL_TARGET" > "$REBOOT_STAMP_FILE" 2>/dev/null || true
+    fi
+    log_message "Rebooting system..."
+    sudo -n shutdown -r now
 }
 
 # ------------------------------------------------------------
@@ -202,6 +241,7 @@ fi
 FORCE_UPDATE=false
 PREFERRED_TERM="lxterminal"     # default terminal
 REBOOT_MODE="none"
+REBOOT_KERNEL_TARGET=""          # kernel that should_reboot() flagged (for the loop-guard stamp)
 POSITIONAL_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -240,6 +280,7 @@ fi
 USER_HOME="$HOME"
 RMS_DIR="$USER_HOME/source/RMS"
 STATIONS_DIR="$USER_HOME/source/Stations"
+REBOOT_STAMP_FILE="$USER_HOME/.rms_reboot_kernel"  # loop-guard: kernel we last rebooted for
 
 # Export display environment for GUI applications (needed when running from cron)
 if [[ -z ${DISPLAY:-} ]]; then
@@ -313,11 +354,12 @@ if [[ "$FORCE_UPDATE" != "true" ]]; then
         
         if [[ -n "$REMOTE_SHA" && "$REMOTE_SHA" == "$LOCAL_SHA" && -z "$MODIFIED_FILES" ]]; then
             if should_reboot; then
-                if sudo -n shutdown --help >/dev/null 2>&1; then
+                # Only stop the running stations once we know the reboot can actually
+                # happen, otherwise we'd leave them down on the no-restart early-exit path.
+                if reboot_available; then
                     log_message "No RMS update needed, but system reboot is required"
                     stop_stations
-                    log_message "Rebooting system..."
-                    sudo shutdown -r now
+                    do_reboot
                     exit 0
                 else
                     log_message "WARNING: System reboot needed but sudo shutdown not available - skipping reboot"
@@ -465,7 +507,7 @@ fi
 # Check if system reboot is needed after update
 if should_reboot; then
     log_message "Attempting system reboot after RMS update..."
-    if sudo -n shutdown -r now 2>/dev/null; then
+    if reboot_available && do_reboot; then
         exit 0
     else
         log_message "WARNING: Reboot failed (sudo shutdown not available) - restarting stations instead"
