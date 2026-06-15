@@ -54,6 +54,14 @@
 #   crontab -e
 #   0 2 * * * /path/to/GRMSUpdater.sh --term gnome-terminal --force
 # This eliminates permission issues and follows the principle of least privilege.
+#
+# OPTIONAL REBOOT: pass --reboot (always) or --reboot-if-needed (only when a reboot
+# is pending, e.g. after a kernel update). The capture user needs passwordless sudo
+# for shutdown, or the reboot is skipped with a warning. Stock Raspberry Pi OS grants
+# the default user blanket NOPASSWD sudo, so no setup is needed there. On hardened
+# setups, grant just the shutdown command (replace my_username):
+#   echo 'my_username ALL=(ALL) NOPASSWD: /usr/sbin/shutdown' | sudo tee /etc/sudoers.d/rms-reboot > /dev/null
+#   sudo chmod 0440 /etc/sudoers.d/rms-reboot
 
 # Lock will be automatically released when script exits
 
