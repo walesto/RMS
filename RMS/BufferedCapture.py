@@ -42,7 +42,7 @@ import json
 
 from RMS.Misc import obfuscatePassword
 from RMS.Routines.GstreamerCapture import GstVideoFile, getStructureValue
-from RMS.Formats.ObservationSummary import getObsDBConn, addObsParam
+from RMS.Formats.ObservationSummary import addObsParam, getObservationSummaryDict
 from RMS.RawFrameSave import RawFrameSaver
 from RMS.Misc import RmsDateTime, mkdirP, UTCFromTimestamp
 from RMS.Formats import FTfile, FTStruct
@@ -95,6 +95,82 @@ class RtspProbeResult:
     TIMEOUT = "TIMEOUT"                    # Connection attempt timed out
     DNS_ERROR = "DNS_ERROR"                # Can't resolve hostname
     UNKNOWN_ERROR = "UNKNOWN_ERROR"        # Other connection errors
+
+
+# madvise() advice constants (Linux asm-generic; valid on x86, arm, arm64 incl. Raspberry Pi)
+MADV_DONTNEED = 4
+MADV_REMOVE = 9
+MADV_DONTFORK = 10
+
+# Resolve libc.madvise once at import time. Stays None on platforms where it is unavailable
+# (non-Linux, no libc.so.6), in which case madviseArray() becomes a safe no-op.
+_LIBC_MADVISE = None
+try:
+    _libc_handle = ctypes.CDLL('libc.so.6', use_errno=True)
+    _libc_handle.madvise.restype = ctypes.c_int
+    _libc_handle.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    _LIBC_MADVISE = _libc_handle.madvise
+except Exception:
+    _LIBC_MADVISE = None
+
+try:
+    _PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+except (ValueError, AttributeError, OSError):
+    _PAGE_SIZE = 4096
+
+
+def madviseArray(arr, advice):
+    """ Apply madvise(advice) to the full backing region of a numpy array.
+
+    madvise() requires a page-aligned start address (else EINVAL), so the address is rounded
+    down to the page boundary and the length extended to compensate. This matters because the
+    array may be a view into a multiprocessing.Array sub-allocation that is not page-aligned.
+
+    Arguments:
+        arr: [ndarray] Array whose backing memory should be advised.
+        advice: [int] One of the MADV_* constants.
+
+    Return:
+        (ok, errno_val): [tuple] ok is True only if madvise returned 0. errno_val is the errno
+            on failure (0 on success, or when madvise is unavailable on this platform).
+    """
+
+    if _LIBC_MADVISE is None:
+        return False, 0
+
+    addr = arr.ctypes.data
+    nbytes = arr.nbytes
+
+    # Round the start down to a page boundary and extend the length to compensate.
+    aligned = addr - (addr % _PAGE_SIZE)
+    length = nbytes + (addr - aligned)
+
+    ctypes.set_errno(0)
+    ret = _LIBC_MADVISE(ctypes.c_void_p(aligned), ctypes.c_size_t(length), advice)
+    if ret == 0:
+        return True, 0
+
+    return False, ctypes.get_errno()
+
+
+def validVideoCrop(crop_str):
+    """ Validate a video_crop string of the form 'top=N bottom=N left=N right=N'
+        (any subset of sides; values must be non-negative integers).
+
+    Arguments:
+        crop_str: [str] The video_crop value from the config.
+
+    Return:
+        [bool] True if the string is a well-formed videocrop spec, False otherwise.
+    """
+
+    valid_keys = {"top", "bottom", "left", "right"}
+    for token in crop_str.split():
+        key, sep, val = token.partition("=")
+        if not sep or key not in valid_keys or not val.isdigit():
+            return False
+
+    return True
 
 
 class BufferedCapture(Process):
@@ -234,28 +310,26 @@ class BufferedCapture(Process):
             log.info("Capture joined successfully after {} seconds".format(seconds_waited))
         else:
             log.info("Timed out after waiting {} seconds, capture thread still alive".format(seconds_waited))
-            log.info("Sending interrupt signal for graceful shutdown...")
-            
+            log.info("Terminating capture process...")
+
             try:
-                # Send SIGINT to allow child process to clean up gracefully
-                if self.pid:
-                    os.kill(self.pid, signal.SIGINT)
-                
+                # Use SIGTERM (terminate) instead of SIGINT to avoid triggering
+                # the main process SIGINT handler via process group propagation
+                self.terminate()
+
                 # Wait a few seconds for graceful shutdown
                 self.join(5)
-                
+
                 if self.is_alive():
-                    log.warning("Process still alive after interrupt, forcing termination")
-                    self.terminate()
+                    log.warning("Process still alive after terminate, sending SIGKILL...")
+                    os.kill(self.pid, signal.SIGKILL)
                 else:
-                    log.info("Process exited gracefully after interrupt")
-                    
+                    log.info("Process terminated successfully")
+
             except ProcessLookupError:
                 log.info("Process already terminated")
             except Exception as e:
-                log.error("Error during graceful shutdown: {}".format(e))
-                log.info("Falling back to terminate()")
-                self.terminate()
+                log.error("Error during termination: {}".format(e))
             
             # Always join to reap zombie (returns instantly if already dead)
             self.join()
@@ -770,21 +844,28 @@ class BufferedCapture(Process):
             stride (int): Spacing for diagonal sampling, skipping many pixels for efficiency.
 
         Returns:
-            bool: True if all sampled channels match (or frame is single-channel), otherwise False.
+            bool or None: True if all sampled channels match (or frame is single-channel),
+                False if channels differ (color), or None if inconclusive (all pixels are
+                the same value, e.g. all white or all black).
         """
         if frame is None:
             raise ValueError("isGrayscale() called with frame=None")
-        
+
         # We don't explicitly check frame.shape first; instead we rely on an IndexError
         # if 'frame' is single-channel (which is inherently grayscale).
-        # This is faster than an extra dimension check for most BGR GMN stations 
+        # This is faster than an extra dimension check for most BGR GMN stations
 
         try:
             # If diagonal samples are not identical, frame is color
             sampled = frame[::stride, ::stride]
             is_gray = np.all(sampled[..., 0] == sampled[..., 1]) and \
                     np.all(sampled[..., 1] == sampled[..., 2])
-            
+
+            # If all sampled pixels have the same value (e.g. all white or all black),
+            # the check is inconclusive — channels match trivially
+            if is_gray and np.all(sampled[..., 0] == sampled[0, 0, 0]):
+                return None
+
         except IndexError:
              # If IndexError, frame is grayscale
             is_gray = True
@@ -1098,24 +1179,32 @@ class BufferedCapture(Process):
             "rtph264depay ! h264parse ! tee name=t"
             ).format(protocol_str, device_url)
 
-        # Optionally scale source video before further processing
+        # Optionally scale and/or crop the source video before further processing.
+        # videoscale/videocrop run on raw decoded frames, ahead of videoconvert.
         video_scale = ''
         if self.config.video_scale_width is not None and self.config.video_scale_height is not None:
-            video_scale = ("videoscale ! video/x-raw,width={:d},height={:d} ! ").format(self.config.video_scale_width, self.config.video_scale_height)
+            video_scale = "videoscale ! video/x-raw,width={:d},height={:d} ! ".format(
+                self.config.video_scale_width, self.config.video_scale_height)
+        elif (self.config.video_scale_width is not None) or (self.config.video_scale_height is not None):
+            log.warning("video_scale ignored: both video_scale_width and video_scale_height must be set")
 
-        # Optionally crop source video before further processing
         video_crop = ''
         if self.config.video_crop is not None:
-            video_crop = ("videocrop {:s} ! ").format(self.config.video_crop)
+            if validVideoCrop(self.config.video_crop):
+                video_crop = "videocrop {:s} ! ".format(self.config.video_crop)
+            else:
+                log.warning("video_crop ignored: malformed value %r (expected e.g. "
+                            "'top=N bottom=N left=N right=N', non-negative ints)", self.config.video_crop)
 
         # Branch for processing
+        queue_size = self.config.gst_queue_size
         processing_branch = (
             "t. ! queue ! {:s} ! "
-            "queue leaky=downstream max-size-buffers=100 max-size-bytes=0 max-size-time=0 ! {:s} {:s} "
+            "queue leaky=downstream max-size-buffers={:d} max-size-bytes=0 max-size-time=0 ! {:s}{:s}"
             "videoconvert ! video/x-raw,format={:s} ! "
-            "queue max-size-buffers=100 max-size-bytes=0 max-size-time=0 ! "
-            "appsink max-buffers=100 drop=true sync=0 name=appsink"
-            ).format(gst_decoder, video_scale, video_crop, video_format)
+            "queue max-size-buffers={:d} max-size-bytes=0 max-size-time=0 ! "
+            "appsink max-buffers={:d} drop=true sync=0 name=appsink"
+            ).format(gst_decoder, queue_size, video_scale, video_crop, video_format, queue_size, queue_size)
         
          # Branch for storage - if video_file_dir is not None, save the raw stream to a file
         if video_file_dir is not None:
@@ -1418,18 +1507,20 @@ class BufferedCapture(Process):
                     buffer.unmap(map_info)
                     
                     # Check if frame is grayscale and set flag
-                    self.convert_to_gray = self.isGrayscale(frame)
-                    log.info("Video format: {}, {}P, color: {}".format(self.config.gst_colorspace, height, 
+                    gray_result = self.isGrayscale(frame)
+                    if gray_result is not None:
+                        self.convert_to_gray = gray_result
+                    log.info("Video format: {}, {}P, color: {}".format(self.config.gst_colorspace, height,
                                                                        not self.convert_to_gray))
 
                     # Set the video device type
                     self.video_device_type = "gst"
 
-                    conn = getObsDBConn(self.config)
-                    try:
-                        addObsParam(conn, "media_backend", self.video_device_type)
-                    finally:
-                        conn.close()
+                    if self.night_data_dir is not None:
+                        try:
+                            addObsParam(getObservationSummaryDict(self.night_data_dir), "media_backend", "gst")
+                        except Exception as e:
+                            log.warning("Could not record media_backend in observation summary: {}".format(e))
 
                     return True
 
@@ -1438,17 +1529,23 @@ class BufferedCapture(Process):
                     self.media_backend_override = True
                     self.releaseResources()
 
-                    conn = getObsDBConn(self.config)
-                    try:
-                        addObsParam(conn, "media_backend", self.video_device_type)
-                    finally:
-                        conn.close()
+
+
 
             if self.config.media_backend == 'v4l2':
                 try:
                     log.info("Initialize OpenCV Device with v4l2.")
                     self.device = cv2.VideoCapture(self.config.deviceID, cv2.CAP_V4L2)
                     self.device.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+
+                    # Note: video_device_type stays "cv2" - downstream logic (isOpened check,
+                    # first-frame skipping) treats v4l2 as an OpenCV device. Only the recorded
+                    # media_backend label is "v4l2".
+                    if self.night_data_dir is not None:
+                        try:
+                            addObsParam(getObservationSummaryDict(self.night_data_dir), "media_backend", "v4l2")
+                        except Exception as e:
+                            log.warning("Could not record media_backend in observation summary: {}".format(e))
 
                     return True
                 
@@ -1462,6 +1559,12 @@ class BufferedCapture(Process):
             elif (self.config.media_backend == 'cv2') or self.media_backend_override:
                 log.info("Initialize OpenCV Device.")
                 self.device = cv2.VideoCapture(self.config.deviceID)
+
+                if self.night_data_dir is not None:
+                    try:
+                        addObsParam(getObservationSummaryDict(self.night_data_dir), "media_backend", "cv2")
+                    except Exception as e:
+                        log.warning("Could not record media_backend in observation summary: {}".format(e))
 
                 return True
 
@@ -1621,25 +1724,26 @@ class BufferedCapture(Process):
                 self.raw_frame_saver.stop()
                 self.raw_frame_saver.join(5)
                 if self.raw_frame_saver.is_alive():
-                    log.warning("RawFrameSaver still busy. Sending interrupt signal...")
+                    log.warning("RawFrameSaver still busy. Terminating...")
                     try:
-                        if self.raw_frame_saver.pid:
-                            os.kill(self.raw_frame_saver.pid, signal.SIGINT)
-                        
+                        # Use terminate (SIGTERM) instead of SIGINT to avoid triggering
+                        # the main process SIGINT handler via process group propagation
+                        self.raw_frame_saver.terminate()
+
                         # Wait for graceful shutdown
                         self.raw_frame_saver.join(3)
-                        
+
                         if self.raw_frame_saver.is_alive():
-                            log.warning("RawFrameSaver still alive after interrupt, forcing termination")
-                            self.raw_frame_saver.terminate()
+                            log.warning("RawFrameSaver still alive after terminate, sending SIGKILL...")
+                            os.kill(self.raw_frame_saver.pid, signal.SIGKILL)
                             self.raw_frame_saver.join()
                         else:
-                            log.info("RawFrameSaver exited gracefully after interrupt")
-                            
+                            log.info("RawFrameSaver terminated successfully")
+
                     except ProcessLookupError:
                         log.info("RawFrameSaver already terminated")
                     except Exception as e:
-                        log.error("Error during graceful RawFrameSaver shutdown: {}".format(e))
+                        log.error("Error during RawFrameSaver termination: {}".format(e))
                         self.raw_frame_saver.terminate()
                         self.raw_frame_saver.join()
             finally:
@@ -1732,7 +1836,7 @@ class BufferedCapture(Process):
             self.pipeline = None
             self.start_timestamp = 0
             self.frame_shape = None
-            self.convert_to_gray = False
+            self.convert_to_gray = not (self.daytime_mode.value if self.daytime_mode is not None else False)
             self.last_pts_correction_ns = 0
             self.last_running_time_ns = None
 
@@ -1782,6 +1886,33 @@ class BufferedCapture(Process):
                 self.last_segment_savetime = time.time()
 
             log.debug("Process-specific initialization complete")
+
+            # Keep the large shared frame buffers (~506 MB each at 1080p) out of the
+            # address space of grandchild processes. These buffers are only needed by
+            # BufferedCapture and Compressor; any subprocess forked from here (e.g.
+            # GStreamer NVENC encoder, RawFrameSaver) does not need them. MADV_DONTFORK
+            # tells the kernel to exclude these pages from any child created via fork(),
+            # so grandchildren never get the mapping at all. Because these are MAP_SHARED
+            # mappings, a grandchild would not duplicate the physical pages, but excluding
+            # the VMAs still avoids inflating the grandchild's RSS / OOM score if it ever
+            # faults them in, and keeps its address space clean.
+            # Compressor is unaffected because it forks from StartCapture, not here.
+            try:
+                total_bytes = 0
+                for arr in (self.array1, self.array2):
+                    ok, err = madviseArray(arr, MADV_DONTFORK)
+                    if ok:
+                        total_bytes += arr.nbytes
+                    else:
+                        log.debug("MADV_DONTFORK failed on a frame buffer (errno {})".format(err))
+
+                if total_bytes:
+                    log.debug("Marked frame buffers ({:.0f} MB) as DONTFORK to prevent "
+                              "inheritance by grandchild processes".format(
+                                  total_bytes / (1024*1024)))
+
+            except Exception as e:
+                log.warning("Could not set MADV_DONTFORK on frame buffers: {}".format(e))
 
             # Main capture loop
             while not self.exit.is_set() and not self.initVideoDevice():
@@ -1912,7 +2043,9 @@ class BufferedCapture(Process):
                     # If the connection was made and the frame was retrieved, continue with the capture
                     if ret:
                         log.info('Video device reconnected successfully!')
-                        self.convert_to_gray = self.isGrayscale(frame)
+                        gray_result = self.isGrayscale(frame)
+                        if gray_result is not None:
+                            self.convert_to_gray = gray_result
                         wait_for_reconnect = False
                         break
 
@@ -1973,7 +2106,9 @@ class BufferedCapture(Process):
 
                 # Check if frame contains color information
                 if save_this_frame:
-                    self.convert_to_gray = self.isGrayscale(frame)
+                    gray_result = self.isGrayscale(frame)
+                    if gray_result is not None:
+                        self.convert_to_gray = gray_result
 
                 # Handling for grayscale conversion
                 frame = self.handleGrayscaleConversion(frame)
@@ -2181,6 +2316,12 @@ class BufferedCapture(Process):
                             self.dropped_frames.value = 0
                             self.dropped_frames_timestamps.clear()
 
+                            # Reset last_frame_timestamp so the reconnection gap after a
+                            # planned transition is not counted as dropped frames. For
+                            # unexpected disconnects this is NOT reset, so those gaps are
+                            # still properly counted.
+                            last_frame_timestamp = False
+
                             # Reset PTS smoothing reset counter for new session
                             self.reset_count = -1
 
@@ -2190,14 +2331,53 @@ class BufferedCapture(Process):
                             # Force device re-initialization by releasing and reconnecting
                             log.info("Releasing resources to re-initialize video device with GStreamer")
                             self.releaseResources()
+
+                            # If transitioning to daytime, release the compression frame
+                            # buffers back to the OS. They are not used during the day
+                            # (frame writes are skipped in daytime mode) and would otherwise
+                            # sit in swap until nightfall.
+                            #
+                            # These buffers are multiprocessing.Array, which on Linux is a
+                            # tmpfs-file-backed MAP_SHARED mapping. MADV_DONTNEED only drops
+                            # the calling process's page-table entries for such a mapping; the
+                            # underlying tmpfs pages are NOT freed (they stay resident / in
+                            # swap). MADV_REMOVE punches a hole in the backing tmpfs file,
+                            # which actually frees the physical pages. We try MADV_REMOVE
+                            # first and fall back to MADV_DONTNEED on filesystems that don't
+                            # support hole-punching. Pages re-fault from the (now zeroed)
+                            # backing store on next write, at no cost.
+                            if current_daytime:
+                                try:
+                                    released_bytes = 0
+                                    for arr in (self.array1, self.array2):
+                                        ok, err = madviseArray(arr, MADV_REMOVE)
+                                        if not ok:
+                                            # MADV_REMOVE unsupported here (e.g. EOPNOTSUPP);
+                                            # fall back to dropping our page-table entries.
+                                            ok, err = madviseArray(arr, MADV_DONTNEED)
+                                        if ok:
+                                            released_bytes += arr.nbytes
+                                        else:
+                                            log.warning("Could not release a compression frame "
+                                                        "buffer (errno {})".format(err))
+
+                                    # Only claim success for buffers actually released, so the log
+                                    # never reports a release that silently failed (e.g. EINVAL).
+                                    if released_bytes:
+                                        log.info("Released compression frame buffers ({:.0f} MB) "
+                                                 "back to OS".format(released_bytes / (1024*1024)))
+                                except Exception as e:
+                                    log.warning("Could not release frame buffers: {}".format(e))
+
                             wait_for_reconnect = True
                             break
 
                         self.last_daytime_mode = current_daytime
 
                         # Calculate buffer fill percentage based on max frame age
-                        # The appsink has max-buffers=100, so at fps rate, max capacity is ~100/fps seconds
-                        max_buffer_time = 100.0 / self.config.fps  # Theoretical max buffer time in seconds
+                        # The appsink has max-buffers=gst_queue_size, so at fps rate, max
+                        # capacity is ~gst_queue_size/fps seconds
+                        max_buffer_time = float(self.config.gst_queue_size) / self.config.fps  # Theoretical max buffer time in seconds
                         buffer_fill_percent = min(100, (max_frame_age_seconds / max_buffer_time) * 100)
 
                         # Calculate dropped frames in last 10 minutes
@@ -2393,7 +2573,7 @@ if __name__ == "__main__":
                              video_file=cml_args.video_file)
         
         bc.initVideoDevice()
-        
+
 
         # Read at least 256 frames from the video file
         for i in range(256):

@@ -218,7 +218,7 @@ def loadConfigFromDirectory(cml_args_config, dir_path):
 
 
         if config_file is None:
-            raise FileNotFoundError("A config file could not be found in directory: {:s}, {:s}".format(
+            raise FileNotFoundError("A config file could not be found in directory: {:s}, config arg: {}".format(
                 dir_path, cml_args_config))
 
         print('Loading config file:', config_file)
@@ -297,6 +297,9 @@ class Config:
 
         # Decoder for the gstreamer media backend (e.g. decodebin, avdec_h264, nvh264dec)
         self.gst_decoder = "avdec_h264"
+
+        # Max buffers per GStreamer queue element (lower values reduce memory usage on multi-cam systems)
+        self.gst_queue_size = 100
 
         # Path to the json file containing camera settings
         self.camera_settings_path = "./camera_settings.json"
@@ -616,7 +619,8 @@ class Config:
         self.ml_filter = 0.5
 
         # Path to the ML model
-        self.ml_model_path = os.path.join(self.rms_root_dir, "share", "hyper_model.tflite")
+        self.ml_model_file = 'hyper_model.tflite'
+        self.ml_model_path = os.path.join(self.rms_root_dir, "share", self.ml_model_file)
 
         # Detection border (in pixels) - detections too close to the border of the mask will be rejected
         self.detection_border = 5
@@ -648,10 +652,10 @@ class Config:
         self.dark_file = 'dark.bmp'
 
         self.star_catalog_path = os.path.join(self.rms_root_dir, 'Catalogs')
-        self.star_catalog_file = 'gaia_dr2_mag_11.5.npy'
+        self.star_catalog_file = 'GMN_StarCatalog'
 
         # Catalog band ratios for Sony CMOS cameras
-        #                                   B     V     R     I   (G    BR    BR)
+        #                                   B     V     R     I    G     BP    RP
         self.star_catalog_band_ratios = [0.15, 0.30, 0.25, 0.30, 0.00, 0.0, 0.00]
 
         self.platepar_name = 'platepar_cmn2010.cal'
@@ -1177,6 +1181,11 @@ def parseCapture(config, parser):
     if parser.has_option(section, "gst_decoder"):
         config.gst_decoder = parser.get(section, "gst_decoder")
 
+    if parser.has_option(section, "gst_queue_size"):
+        # Clamp to >= 1: in GStreamer max-size-buffers=0 means *unlimited*, which would
+        # defeat the purpose of this setting and risk OOM.
+        config.gst_queue_size = max(1, parser.getint(section, "gst_queue_size"))
+
     if parser.has_option(section, "camera_settings_path") and os.path.isfile(parser.get(section, "camera_settings_path")):
         config.camera_settings_path = parser.get(section, "camera_settings_path")
     else:
@@ -1683,15 +1692,21 @@ def parseMeteorDetection(config, parser):
     if parser.has_option(section, "min_patch_intensity_multiplier"):
         config.min_patch_intensity_multiplier = parser.getfloat(section, "min_patch_intensity_multiplier")
 
+    if parser.has_option(section, "ml_model_file"):
+        config.ml_model_file = parser.get(section, "ml_model_file")
+        config.ml_model_path = os.path.join(config.rms_root_dir, "share", config.ml_model_file)
+
     if parser.has_option(section, "ml_filter"):
         # since most of the old configs have threshold 0.85, and the current model is calibrated to 0.5,
-        # we need to rescale the value here
-        config.ml_filter = parser.getfloat(section, "ml_filter") * 0.5/0.85
+        # we need to rescale the value here - only for new model
+        if (config.ml_model_file == "hyper_model.tflite"):
+            config.ml_filter = parser.getfloat(section, "ml_filter") * 0.5/0.85
+        else:
+            config.ml_filter = parser.getfloat(section, "ml_filter")
 
         # Disable the min_patch_intensity filter if the ML filter is used and the ML library is available
         if TFLITE_AVAILABLE and (config.ml_filter > 0):
             config.min_patch_intensity_multiplier = 0
-
 
     if parser.has_option(section, "detection_border"):
         config.detection_border = parser.getint(section, "detection_border")

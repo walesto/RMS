@@ -30,7 +30,7 @@ import threading
 import multiprocessing
 import traceback
 import git
-from RMS.Formats.ObservationSummary import getObsDBConn, addObsParam
+from RMS.Formats.ObservationSummary import addObsParam, getObservationSummaryDict
 
 import numpy as np
 
@@ -67,8 +67,7 @@ def breakHandler(signum, frame):
     # Set the flag to stop capturing video
     STOP_CAPTURE = True
 
-    # This log entry is an adhoc fix to prevents Ctrl+C failure until the root cause is identified
-    log.info("Ctrl+C pressed. Setting STOP_CAPTURE to True")
+    log.info("SIGINT received. Setting STOP_CAPTURE to True")
 
 # Save the original event for the Ctrl+C
 ORIGINAL_BREAK_HANDLE = signal.getsignal(signal.SIGINT)
@@ -615,7 +614,7 @@ def runCapture(config, duration=None, video_file=None, nodetect=False, detect_en
 
             # Open the observation summary report
             if video_file is None:
-                log.info(startObservationSummaryReport(config, duration, force_delete=False))
+                log.info(startObservationSummaryReport(config, night_data_dir, duration, force_delete=False))
 
             # Start the compressor
             compressor.start()
@@ -720,9 +719,10 @@ def runCapture(config, duration=None, video_file=None, nodetect=False, detect_en
             log.debug('Capture stopped')
 
             log.info('Total number of late or dropped frames: ' + str(dropped_frames))
-            obs_db_conn = getObsDBConn(config)
-            addObsParam(obs_db_conn, "dropped_frames", dropped_frames)
-            obs_db_conn.close()
+            log.info(f"Starting an observation summary in {night_data_dir}")
+            obs_dict = getObservationSummaryDict(night_data_dir)
+            addObsParam(obs_dict, "dropped_frames", dropped_frames)
+
 
             # Free shared memory after the compressor is done
             try:
@@ -829,6 +829,9 @@ def runCapture(config, duration=None, video_file=None, nodetect=False, detect_en
 
                 # Get the detection results from the queue
                 detection_results = detector.getResults()
+
+                # Shut down the Manager server process now that results are collected
+                detector.shutdownManager()
 
             else:
 
@@ -1208,6 +1211,8 @@ if __name__ == "__main__":
     # Automatic running and stopping the capture at sunrise and sunset
     ran_once = False
     slideshow_view = None
+    switcher_stop_event = None
+    capture_switcher = None
     while True:
 
         if config.continuous_capture:
@@ -1221,8 +1226,10 @@ if __name__ == "__main__":
 
             # Calculate when and how should the capture run
             start_time, duration = captureDuration(config.latitude, config.longitude, config.elevation)
-            log.info('Next start time: ' + str(start_time) + ' UTC')
-
+            if isinstance(start_time, bool):
+                log.info(f'captureDuration returned {start_time}')
+            else:
+                log.info(f'Next start time: {start_time} UTC')
 
         # Reboot the computer after processing is done for the previous night
         if ran_once and config.reboot_after_processing:
@@ -1283,6 +1290,10 @@ if __name__ == "__main__":
 
                 ### ###
 
+            # If reboot didn't happen in continuous capture mode, reset so capture resumes normally
+            if config.continuous_capture:
+                log.warning("Reboot failed after 4 hours of attempts, resuming capture")
+                ran_once = False
 
 
         # Don't start the capture if there's less than 15 minutes left
@@ -1477,17 +1488,26 @@ if __name__ == "__main__":
 
 
         if config.continuous_capture:
-            
+
+            # Stop the previous capture mode switcher thread if it's still running
+            if switcher_stop_event is not None:
+                log.info('Stopping previous capture mode switcher thread...')
+                switcher_stop_event.set()
+                capture_switcher.join(timeout=10)
+                if capture_switcher.is_alive():
+                    log.warning('Previous capture mode switcher thread did not stop in time')
+
             # Setup shared value to communicate day/night switch between processes.
             daytime_mode = multiprocessing.Value(ctypes.c_bool, False)
             camera_mode_switch_trigger = multiprocessing.Value(ctypes.c_bool, True)
 
             # Setup the capture mode switcher on another thread
-            capture_switcher = threading.Thread(target=captureModeSwitcher, args=(config, daytime_mode, camera_mode_switch_trigger))
-            
+            switcher_stop_event = threading.Event()
+            capture_switcher = threading.Thread(target=captureModeSwitcher, args=(config, daytime_mode, camera_mode_switch_trigger, switcher_stop_event))
+
             # To make sure the capture switcher thread exits automatically at the end
             capture_switcher.daemon = True
-            
+
             capture_switcher.start()
 
             # Wait for the switcher to complete calculation and switch to correct camera mode
