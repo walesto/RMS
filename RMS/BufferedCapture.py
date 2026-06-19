@@ -97,6 +97,62 @@ class RtspProbeResult:
     UNKNOWN_ERROR = "UNKNOWN_ERROR"        # Other connection errors
 
 
+# madvise() advice constants (Linux asm-generic; valid on x86, arm, arm64 incl. Raspberry Pi)
+MADV_DONTNEED = 4
+MADV_REMOVE = 9
+MADV_DONTFORK = 10
+
+# Resolve libc.madvise once at import time. Stays None on platforms where it is unavailable
+# (non-Linux, no libc.so.6), in which case madviseArray() becomes a safe no-op.
+_LIBC_MADVISE = None
+try:
+    _libc_handle = ctypes.CDLL('libc.so.6', use_errno=True)
+    _libc_handle.madvise.restype = ctypes.c_int
+    _libc_handle.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    _LIBC_MADVISE = _libc_handle.madvise
+except Exception:
+    _LIBC_MADVISE = None
+
+try:
+    _PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+except (ValueError, AttributeError, OSError):
+    _PAGE_SIZE = 4096
+
+
+def madviseArray(arr, advice):
+    """ Apply madvise(advice) to the full backing region of a numpy array.
+
+    madvise() requires a page-aligned start address (else EINVAL), so the address is rounded
+    down to the page boundary and the length extended to compensate. This matters because the
+    array may be a view into a multiprocessing.Array sub-allocation that is not page-aligned.
+
+    Arguments:
+        arr: [ndarray] Array whose backing memory should be advised.
+        advice: [int] One of the MADV_* constants.
+
+    Return:
+        (ok, errno_val): [tuple] ok is True only if madvise returned 0. errno_val is the errno
+            on failure (0 on success, or when madvise is unavailable on this platform).
+    """
+
+    if _LIBC_MADVISE is None:
+        return False, 0
+
+    addr = arr.ctypes.data
+    nbytes = arr.nbytes
+
+    # Round the start down to a page boundary and extend the length to compensate.
+    aligned = addr - (addr % _PAGE_SIZE)
+    length = nbytes + (addr - aligned)
+
+    ctypes.set_errno(0)
+    ret = _LIBC_MADVISE(ctypes.c_void_p(aligned), ctypes.c_size_t(length), advice)
+    if ret == 0:
+        return True, 0
+
+    return False, ctypes.get_errno()
+
+
 class BufferedCapture(Process):
     """ Capture from device to buffer in memory.
     """
@@ -1793,19 +1849,13 @@ class BufferedCapture(Process):
             # faults them in, and keeps its address space clean.
             # Compressor is unaffected because it forks from StartCapture, not here.
             try:
-                _libc = ctypes.CDLL('libc.so.6', use_errno=True)
-                _libc.madvise.restype = ctypes.c_int
-                _libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
-                MADV_DONTFORK = 10
-
                 total_bytes = 0
                 for arr in (self.array1, self.array2):
-                    try:
-                        ret = _libc.madvise(arr.ctypes.data, arr.nbytes, MADV_DONTFORK)
-                        if ret == 0:
-                            total_bytes += arr.nbytes
-                    except Exception:
-                        pass
+                    ok, err = madviseArray(arr, MADV_DONTFORK)
+                    if ok:
+                        total_bytes += arr.nbytes
+                    else:
+                        log.debug("MADV_DONTFORK failed on a frame buffer (errno {})".format(err))
 
                 if total_bytes:
                     log.debug("Marked frame buffers ({:.0f} MB) as DONTFORK to prevent "
@@ -2249,19 +2299,24 @@ class BufferedCapture(Process):
                             # backing store on next write, at no cost.
                             if current_daytime:
                                 try:
-                                    _libc = ctypes.CDLL('libc.so.6', use_errno=True)
-                                    _libc.madvise.restype = ctypes.c_int
-                                    _libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
-                                    MADV_DONTNEED = 4
-                                    MADV_REMOVE = 9
+                                    released_bytes = 0
                                     for arr in (self.array1, self.array2):
-                                        ret = _libc.madvise(arr.ctypes.data, arr.nbytes, MADV_REMOVE)
-                                        if ret != 0:
+                                        ok, err = madviseArray(arr, MADV_REMOVE)
+                                        if not ok:
                                             # MADV_REMOVE unsupported here (e.g. EOPNOTSUPP);
                                             # fall back to dropping our page-table entries.
-                                            _libc.madvise(arr.ctypes.data, arr.nbytes, MADV_DONTNEED)
-                                    log.info("Released compression frame buffers ({:.0f} MB) back to OS".format(
-                                        sum(a.nbytes for a in (self.array1, self.array2)) / (1024*1024)))
+                                            ok, err = madviseArray(arr, MADV_DONTNEED)
+                                        if ok:
+                                            released_bytes += arr.nbytes
+                                        else:
+                                            log.warning("Could not release a compression frame "
+                                                        "buffer (errno {})".format(err))
+
+                                    # Only claim success for buffers actually released, so the log
+                                    # never reports a release that silently failed (e.g. EINVAL).
+                                    if released_bytes:
+                                        log.info("Released compression frame buffers ({:.0f} MB) "
+                                                 "back to OS".format(released_bytes / (1024*1024)))
                                 except Exception as e:
                                     log.warning("Could not release frame buffers: {}".format(e))
 
