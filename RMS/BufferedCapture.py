@@ -1098,7 +1098,12 @@ class BufferedCapture(Process):
 
         # Define the source up to the point where we want to branch off
         source_to_tee = (
-            "rtspsrc name=src buffer-mode=1 {:s} "
+            # udp-buffer-size: per-socket RTP receive buffer. rtspsrc defaults to
+            # 512KB, which can overflows during bitrate bursts and shows
+            # up as net UDP RcvbufErrors -> dropped frames. 16MB gives bursts room.
+            # NOTE: net.core.rmem_max must be >= this value (see Scripts/UpdateBuffers.sh)
+            # or the kernel clamps it back. Only affects the UDP transport path.
+            "rtspsrc name=src buffer-mode=1 udp-buffer-size=16777216 {:s} "
             "location=\"{:s}\" ! "
             "rtph264depay ! h264parse ! tee name=t"
             ).format(protocol_str, device_url)

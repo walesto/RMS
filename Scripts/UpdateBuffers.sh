@@ -24,8 +24,8 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # Configuration
-RECOMMENDED_SIZE=1048576  # 1MB in bytes
-MIN_RECOMMENDED=524288    # 512KB in bytes (GStreamer requested size)
+RECOMMENDED_SIZE=16777216  # 16MB in bytes - must be >= rtspsrc udp-buffer-size in BufferedCapture.py
+MIN_RECOMMENDED=1048576    # 1MB in bytes (old default; below this UDP RtspSrc bursts overflow)
 
 # Function to convert bytes to human readable format
 human_readable() {
