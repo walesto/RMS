@@ -59,7 +59,9 @@
 # is pending, e.g. after a kernel update). The capture user needs passwordless sudo
 # for shutdown, or the reboot is skipped with a warning. Stock Raspberry Pi OS grants
 # the default user blanket NOPASSWD sudo, so no setup is needed there. On hardened
-# setups, grant just the shutdown command (replace my_username):
+# setups, grant just the shutdown command (replace my_username). Pin the absolute
+# path that `command -v shutdown` reports on your system - sudo matches the rule
+# against that path, so /sbin/shutdown vs /usr/sbin/shutdown matters:
 #   echo 'my_username ALL=(ALL) NOPASSWD: /usr/sbin/shutdown' | sudo tee /etc/sudoers.d/rms-reboot > /dev/null
 #   sudo chmod 0440 /etc/sudoers.d/rms-reboot
 
@@ -142,7 +144,9 @@ should_reboot() {
 #  reboot_available() – true if passwordless `sudo shutdown` works
 # ------------------------------------------------------------
 reboot_available() {
-    sudo -n shutdown --help >/dev/null 2>&1
+    # Probe with the resolved absolute path so this matches what do_reboot runs and
+    # what the sudoers rule pins (sudo matches rules against the absolute command path).
+    [[ -n "${SHUTDOWN_BIN:-}" ]] && sudo -n "$SHUTDOWN_BIN" --help >/dev/null 2>&1
 }
 
 # ------------------------------------------------------------
@@ -156,7 +160,7 @@ do_reboot() {
         echo "$REBOOT_KERNEL_TARGET" > "$REBOOT_STAMP_FILE" 2>/dev/null || true
     fi
     log_message "Rebooting system..."
-    sudo -n shutdown -r now
+    sudo -n "$SHUTDOWN_BIN" -r now
 }
 
 # ------------------------------------------------------------
@@ -233,168 +237,6 @@ stop_stations() {
         log_message "No running RMS stations found"
     fi
 }
-
-# Log script start
-log_message "GRMSUpdater.sh started with args: $*"
-
-# Use flock to prevent multiple instances from running simultaneously
-LOCKFILE="/tmp/rms_grms_updater.lock"
-exec 200>"$LOCKFILE"
-if ! flock -n 200; then
-    log_message "Another GRMSUpdater instance is already running. Exiting."
-    exit 1
-fi
-
-# Parse command line arguments
-FORCE_UPDATE=false
-PREFERRED_TERM="lxterminal"     # default terminal
-REBOOT_MODE="none"
-REBOOT_KERNEL_TARGET=""          # kernel that should_reboot() flagged (for the loop-guard stamp)
-POSITIONAL_ARGS=()
-
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        --term)
-            PREFERRED_TERM="$2"
-            shift 2
-            ;;
-        --force)
-            FORCE_UPDATE=true
-            shift
-            ;;
-        --reboot-if-needed)
-            REBOOT_MODE="if-needed"
-            shift
-            ;;
-        --reboot)
-            REBOOT_MODE="always"
-            shift
-            ;;
-        *)
-            POSITIONAL_ARGS+=("$1")
-            shift
-            ;;
-    esac
-done
-
-# Restore positional parameters
-if [[ ${#POSITIONAL_ARGS[@]} -gt 0 ]]; then
-    set -- "${POSITIONAL_ARGS[@]}"
-else
-    set --  # Clear positional parameters
-fi
-
-# Set up path variables (running as capture user)
-USER_HOME="$HOME"
-RMS_DIR="$USER_HOME/source/RMS"
-STATIONS_DIR="$USER_HOME/source/Stations"
-REBOOT_STAMP_FILE="$USER_HOME/.rms_reboot_kernel"  # loop-guard: kernel we last rebooted for
-
-# Export display environment for GUI applications (needed when running from cron)
-if [[ -z ${DISPLAY:-} ]]; then
-    DISPLAY=$(who | awk '/\(:[0-9]/{print $NF; exit}' | tr -d '()')
-    if [[ -n "$DISPLAY" ]]; then
-        export DISPLAY
-        log_message "Auto-detected DISPLAY=$DISPLAY"
-    else
-        log_message "Warning: Could not detect DISPLAY from 'who' output"
-    fi
-fi
-
-if [[ -n "$DISPLAY" ]]; then
-    export XAUTHORITY="$HOME/.Xauthority"
-    log_message "Using DISPLAY=$DISPLAY"
-    
-    # Set XDG_RUNTIME_DIR if not already set (needed for some terminals)
-    if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
-        uid=$(id -u)
-        export XDG_RUNTIME_DIR="/run/user/$uid"
-        log_message "Set XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
-    fi
-    
-    # Set up D-Bus for gnome-terminal (when running from cron)
-    # Wrap in error handling to prevent crashes
-    if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
-        # Get UID safely
-        uid=""
-        if command -v id >/dev/null 2>&1; then
-            uid=$(id -u 2>/dev/null || echo "1000")
-        else
-            uid="1000"
-        fi
-        
-        bus_path="/run/user/${uid}/bus"
-        if [[ -e "$bus_path" ]] && [[ -S "$bus_path" ]]; then
-            export DBUS_SESSION_BUS_ADDRESS="unix:path=$bus_path"
-            log_message "Auto-set DBUS_SESSION_BUS_ADDRESS for gnome-terminal"
-        else
-            log_message "D-Bus session bus not available at $bus_path (normal in cron context)"
-        fi
-    else
-        log_message "DBUS_SESSION_BUS_ADDRESS already set: $DBUS_SESSION_BUS_ADDRESS"
-    fi
-else
-    log_message "No DISPLAY available - GUI terminals will fail, consider using --term tmux"
-fi
-
-# Find running stations by looking for StartCapture.sh processes
-mapfile -t RunList < <(
-    pgrep -f "Scripts/MultiCamLinux/StartCapture.sh" | while read -r pid; do
-        cmdline=$(ps -p "$pid" -o args= 2>/dev/null || continue)
-        if [[ "$cmdline" =~ Scripts/MultiCamLinux/StartCapture\.sh[[:space:]]+([[:alnum:]]{6}) ]]; then
-            echo "${BASH_REMATCH[1]}"
-        fi
-    done | sort -u
-)
-
-# Check if updates are actually needed before disrupting running processes (unless --force is used)
-if [[ "$FORCE_UPDATE" != "true" ]]; then
-    cd "$RMS_DIR" || { log_message "Error: RMS directory not found at $RMS_DIR"; exit 1; }
-
-    # Get current branch and check for updates (similar to RMS_Update.sh early check)
-    CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
-    if [[ "$CURRENT_BRANCH" != "unknown" ]]; then
-        REMOTE_SHA=$(timeout 15s git ls-remote --quiet --heads origin "refs/heads/$CURRENT_BRANCH" | cut -f1)
-        LOCAL_SHA=$(git rev-parse HEAD)
-        
-        # Check for modified tracked files (excluding allowed config files)
-        MODIFIED_FILES=$(git diff --name-only | grep -v -E '^(\.config|camera_settings\.json)$' || true)
-        
-        if [[ -n "$REMOTE_SHA" && "$REMOTE_SHA" == "$LOCAL_SHA" && -z "$MODIFIED_FILES" ]]; then
-            if should_reboot; then
-                # Only stop the running stations once we know the reboot can actually
-                # happen, otherwise we'd leave them down on the no-restart early-exit path.
-                if reboot_available; then
-                    log_message "No RMS update needed, but system reboot is required"
-                    stop_stations
-                    do_reboot
-                    exit 0
-                else
-                    log_message "WARNING: System reboot needed but sudo shutdown not available - skipping reboot"
-                    log_message "Configure /etc/sudoers.d/rms-reboot to enable passwordless shutdown"
-                fi
-            fi
-            log_message "RMS is already up to date ($CURRENT_BRANCH: $LOCAL_SHA) and no tracked file modifications - no need to restart stations"
-            log_message "Use --force to restart stations anyway"
-            log_message "GRMSUpdater.sh completed successfully (early exit - no updates needed)"
-            exit 0
-        elif [[ -n "$REMOTE_SHA" && "$REMOTE_SHA" == "$LOCAL_SHA" && -n "$MODIFIED_FILES" ]]; then
-            log_message "Repository up to date but tracked files modified:"
-            echo "$MODIFIED_FILES" | sed 's/^/  /' | while read -r line; do log_message "$line"; done
-            log_message "Proceeding with restart to restore tracked files"
-        else
-            log_message "Updates available for RMS ($CURRENT_BRANCH: $LOCAL_SHA → $REMOTE_SHA) - proceeding with restart"
-        fi
-    else
-        log_message "Warning: Could not determine current branch, proceeding with update"
-    fi
-else
-    log_message "Force update requested - proceeding with restart regardless of update status"
-    cd "$RMS_DIR" || { log_message "Error: RMS directory not found at $RMS_DIR"; exit 1; }
-fi
-
-# Stop running stations before update
-stop_stations
 
 # Note: When run from user cron, DISPLAY may not be set. Terminal launching will fall back to tmux if needed.
 
@@ -503,6 +345,189 @@ restart_stations() {
     done
 }
 
+# Log script start
+log_message "GRMSUpdater.sh started with args: $*"
+
+# Use flock to prevent multiple instances from running simultaneously
+LOCKFILE="/tmp/rms_grms_updater.lock"
+exec 200>"$LOCKFILE"
+if ! flock -n 200; then
+    log_message "Another GRMSUpdater instance is already running. Exiting."
+    exit 1
+fi
+
+# Parse command line arguments
+FORCE_UPDATE=false
+PREFERRED_TERM="lxterminal"     # default terminal
+REBOOT_MODE="none"
+REBOOT_KERNEL_TARGET=""          # kernel that should_reboot() flagged (for the loop-guard stamp)
+POSITIONAL_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --term)
+            PREFERRED_TERM="$2"
+            shift 2
+            ;;
+        --force)
+            FORCE_UPDATE=true
+            shift
+            ;;
+        --reboot-if-needed)
+            REBOOT_MODE="if-needed"
+            shift
+            ;;
+        --reboot)
+            REBOOT_MODE="always"
+            shift
+            ;;
+        *)
+            POSITIONAL_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Restore positional parameters
+if [[ ${#POSITIONAL_ARGS[@]} -gt 0 ]]; then
+    set -- "${POSITIONAL_ARGS[@]}"
+else
+    set --  # Clear positional parameters
+fi
+
+# Set up path variables (running as capture user)
+USER_HOME="$HOME"
+RMS_DIR="$USER_HOME/source/RMS"
+STATIONS_DIR="$USER_HOME/source/Stations"
+REBOOT_STAMP_FILE="$USER_HOME/.rms_reboot_kernel"  # loop-guard: kernel we last rebooted for
+
+# Resolve the absolute path to shutdown. sudo matches sudoers rules against the
+# absolute command path, and cron's minimal PATH usually omits /usr/sbin and /sbin,
+# so resolve it explicitly. Distros differ (Debian/RPi OS: /usr/sbin/shutdown; others
+# /sbin/shutdown); the NOPASSWD rule must pin whichever this resolves to.
+SHUTDOWN_BIN="$(command -v shutdown 2>/dev/null || true)"
+if [[ -z "$SHUTDOWN_BIN" ]]; then
+    for _candidate in /usr/sbin/shutdown /sbin/shutdown /bin/shutdown; do
+        if [[ -x "$_candidate" ]]; then
+            SHUTDOWN_BIN="$_candidate"
+            break
+        fi
+    done
+fi
+
+# Export display environment for GUI applications (needed when running from cron)
+if [[ -z ${DISPLAY:-} ]]; then
+    DISPLAY=$(who | awk '/\(:[0-9]/{print $NF; exit}' | tr -d '()')
+    if [[ -n "$DISPLAY" ]]; then
+        export DISPLAY
+        log_message "Auto-detected DISPLAY=$DISPLAY"
+    else
+        log_message "Warning: Could not detect DISPLAY from 'who' output"
+    fi
+fi
+
+if [[ -n "$DISPLAY" ]]; then
+    export XAUTHORITY="$HOME/.Xauthority"
+    log_message "Using DISPLAY=$DISPLAY"
+    
+    # Set XDG_RUNTIME_DIR if not already set (needed for some terminals)
+    if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+        uid=$(id -u)
+        export XDG_RUNTIME_DIR="/run/user/$uid"
+        log_message "Set XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
+    fi
+    
+    # Set up D-Bus for gnome-terminal (when running from cron)
+    # Wrap in error handling to prevent crashes
+    if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+        # Get UID safely
+        uid=""
+        if command -v id >/dev/null 2>&1; then
+            uid=$(id -u 2>/dev/null || echo "1000")
+        else
+            uid="1000"
+        fi
+        
+        bus_path="/run/user/${uid}/bus"
+        if [[ -e "$bus_path" ]] && [[ -S "$bus_path" ]]; then
+            export DBUS_SESSION_BUS_ADDRESS="unix:path=$bus_path"
+            log_message "Auto-set DBUS_SESSION_BUS_ADDRESS for gnome-terminal"
+        else
+            log_message "D-Bus session bus not available at $bus_path (normal in cron context)"
+        fi
+    else
+        log_message "DBUS_SESSION_BUS_ADDRESS already set: $DBUS_SESSION_BUS_ADDRESS"
+    fi
+else
+    log_message "No DISPLAY available - GUI terminals will fail, consider using --term tmux"
+fi
+
+# Find running stations by looking for StartCapture.sh processes
+mapfile -t RunList < <(
+    pgrep -f "Scripts/MultiCamLinux/StartCapture.sh" | while read -r pid; do
+        cmdline=$(ps -p "$pid" -o args= 2>/dev/null || continue)
+        if [[ "$cmdline" =~ Scripts/MultiCamLinux/StartCapture\.sh[[:space:]]+([[:alnum:]]{6}) ]]; then
+            echo "${BASH_REMATCH[1]}"
+        fi
+    done | sort -u
+)
+
+# Check if updates are actually needed before disrupting running processes (unless --force is used)
+if [[ "$FORCE_UPDATE" != "true" ]]; then
+    cd "$RMS_DIR" || { log_message "Error: RMS directory not found at $RMS_DIR"; exit 1; }
+
+    # Get current branch and check for updates (similar to RMS_Update.sh early check)
+    CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+    if [[ "$CURRENT_BRANCH" != "unknown" ]]; then
+        REMOTE_SHA=$(timeout 15s git ls-remote --quiet --heads origin "refs/heads/$CURRENT_BRANCH" | cut -f1)
+        LOCAL_SHA=$(git rev-parse HEAD)
+        
+        # Check for modified tracked files (excluding allowed config files)
+        MODIFIED_FILES=$(git diff --name-only | grep -v -E '^(\.config|camera_settings\.json)$' || true)
+        
+        if [[ -n "$REMOTE_SHA" && "$REMOTE_SHA" == "$LOCAL_SHA" && -z "$MODIFIED_FILES" ]]; then
+            if should_reboot; then
+                # Only stop the running stations once we know the reboot can actually
+                # happen, otherwise we'd leave them down on the no-restart early-exit path.
+                if reboot_available; then
+                    log_message "No RMS update needed, but system reboot is required"
+                    stop_stations
+                    if do_reboot; then
+                        exit 0
+                    fi
+                    # Reboot was available a moment ago but the shutdown call itself
+                    # failed; don't leave the stations down - restart the ones we stopped.
+                    log_message "WARNING: Reboot command failed after stopping stations - restarting them"
+                    if [[ ${#RunList[@]} -gt 0 ]]; then
+                        restart_stations "${RunList[@]}"
+                    fi
+                    exit 1
+                else
+                    log_message "WARNING: System reboot needed but sudo shutdown not available - skipping reboot"
+                    log_message "Configure /etc/sudoers.d/rms-reboot to enable passwordless shutdown"
+                fi
+            fi
+            log_message "RMS is already up to date ($CURRENT_BRANCH: $LOCAL_SHA) and no tracked file modifications - no need to restart stations"
+            log_message "Use --force to restart stations anyway"
+            log_message "GRMSUpdater.sh completed successfully (early exit - no updates needed)"
+            exit 0
+        elif [[ -n "$REMOTE_SHA" && "$REMOTE_SHA" == "$LOCAL_SHA" && -n "$MODIFIED_FILES" ]]; then
+            log_message "Repository up to date but tracked files modified:"
+            echo "$MODIFIED_FILES" | sed 's/^/  /' | while read -r line; do log_message "$line"; done
+            log_message "Proceeding with restart to restore tracked files"
+        else
+            log_message "Updates available for RMS ($CURRENT_BRANCH: $LOCAL_SHA → $REMOTE_SHA) - proceeding with restart"
+        fi
+    else
+        log_message "Warning: Could not determine current branch, proceeding with update"
+    fi
+else
+    log_message "Force update requested - proceeding with restart regardless of update status"
+    cd "$RMS_DIR" || { log_message "Error: RMS directory not found at $RMS_DIR"; exit 1; }
+fi
+
+# Stop running stations before update
+stop_stations
 
 # Run the actual RMS update
 log_message "Running RMS update..."
