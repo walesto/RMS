@@ -97,6 +97,62 @@ class RtspProbeResult:
     UNKNOWN_ERROR = "UNKNOWN_ERROR"        # Other connection errors
 
 
+# madvise() advice constants (Linux asm-generic; valid on x86, arm, arm64 incl. Raspberry Pi)
+MADV_DONTNEED = 4
+MADV_REMOVE = 9
+MADV_DONTFORK = 10
+
+# Resolve libc.madvise once at import time. Stays None on platforms where it is unavailable
+# (non-Linux, no libc.so.6), in which case madviseArray() becomes a safe no-op.
+_LIBC_MADVISE = None
+try:
+    _libc_handle = ctypes.CDLL('libc.so.6', use_errno=True)
+    _libc_handle.madvise.restype = ctypes.c_int
+    _libc_handle.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    _LIBC_MADVISE = _libc_handle.madvise
+except Exception:
+    _LIBC_MADVISE = None
+
+try:
+    _PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+except (ValueError, AttributeError, OSError):
+    _PAGE_SIZE = 4096
+
+
+def madviseArray(arr, advice):
+    """ Apply madvise(advice) to the full backing region of a numpy array.
+
+    madvise() requires a page-aligned start address (else EINVAL), so the address is rounded
+    down to the page boundary and the length extended to compensate. This matters because the
+    array may be a view into a multiprocessing.Array sub-allocation that is not page-aligned.
+
+    Arguments:
+        arr: [ndarray] Array whose backing memory should be advised.
+        advice: [int] One of the MADV_* constants.
+
+    Return:
+        (ok, errno_val): [tuple] ok is True only if madvise returned 0. errno_val is the errno
+            on failure (0 on success, or when madvise is unavailable on this platform).
+    """
+
+    if _LIBC_MADVISE is None:
+        return False, 0
+
+    addr = arr.ctypes.data
+    nbytes = arr.nbytes
+
+    # Round the start down to a page boundary and extend the length to compensate.
+    aligned = addr - (addr % _PAGE_SIZE)
+    length = nbytes + (addr - aligned)
+
+    ctypes.set_errno(0)
+    ret = _LIBC_MADVISE(ctypes.c_void_p(aligned), ctypes.c_size_t(length), advice)
+    if ret == 0:
+        return True, 0
+
+    return False, ctypes.get_errno()
+
+
 class BufferedCapture(Process):
     """ Capture from device to buffer in memory.
     """
@@ -1104,13 +1160,14 @@ class BufferedCapture(Process):
             ).format(protocol_str, device_url)
 
         # Branch for processing
+        queue_size = self.config.gst_queue_size
         processing_branch = (
             "t. ! queue ! {:s} ! "
-            "queue leaky=downstream max-size-buffers=100 max-size-bytes=0 max-size-time=0 ! "
+            "queue leaky=downstream max-size-buffers={:d} max-size-bytes=0 max-size-time=0 ! "
             "videoconvert ! video/x-raw,format={:s} ! "
-            "queue max-size-buffers=100 max-size-bytes=0 max-size-time=0 ! "
-            "appsink max-buffers=100 drop=true sync=0 name=appsink"
-            ).format(gst_decoder, video_format)
+            "queue max-size-buffers={:d} max-size-bytes=0 max-size-time=0 ! "
+            "appsink max-buffers={:d} drop=true sync=0 name=appsink"
+            ).format(gst_decoder, queue_size, video_format, queue_size, queue_size)
         
          # Branch for storage - if video_file_dir is not None, save the raw stream to a file
         if video_file_dir is not None:
@@ -1793,6 +1850,33 @@ class BufferedCapture(Process):
 
             log.debug("Process-specific initialization complete")
 
+            # Keep the large shared frame buffers (~506 MB each at 1080p) out of the
+            # address space of grandchild processes. These buffers are only needed by
+            # BufferedCapture and Compressor; any subprocess forked from here (e.g.
+            # GStreamer NVENC encoder, RawFrameSaver) does not need them. MADV_DONTFORK
+            # tells the kernel to exclude these pages from any child created via fork(),
+            # so grandchildren never get the mapping at all. Because these are MAP_SHARED
+            # mappings, a grandchild would not duplicate the physical pages, but excluding
+            # the VMAs still avoids inflating the grandchild's RSS / OOM score if it ever
+            # faults them in, and keeps its address space clean.
+            # Compressor is unaffected because it forks from StartCapture, not here.
+            try:
+                total_bytes = 0
+                for arr in (self.array1, self.array2):
+                    ok, err = madviseArray(arr, MADV_DONTFORK)
+                    if ok:
+                        total_bytes += arr.nbytes
+                    else:
+                        log.debug("MADV_DONTFORK failed on a frame buffer (errno {})".format(err))
+
+                if total_bytes:
+                    log.debug("Marked frame buffers ({:.0f} MB) as DONTFORK to prevent "
+                              "inheritance by grandchild processes".format(
+                                  total_bytes / (1024*1024)))
+
+            except Exception as e:
+                log.warning("Could not set MADV_DONTFORK on frame buffers: {}".format(e))
+
             # Main capture loop
             while not self.exit.is_set() and not self.initVideoDevice():
                 # Update heartbeat during connection attempts to show we're still alive
@@ -2210,14 +2294,53 @@ class BufferedCapture(Process):
                             # Force device re-initialization by releasing and reconnecting
                             log.info("Releasing resources to re-initialize video device with GStreamer")
                             self.releaseResources()
+
+                            # If transitioning to daytime, release the compression frame
+                            # buffers back to the OS. They are not used during the day
+                            # (frame writes are skipped in daytime mode) and would otherwise
+                            # sit in swap until nightfall.
+                            #
+                            # These buffers are multiprocessing.Array, which on Linux is a
+                            # tmpfs-file-backed MAP_SHARED mapping. MADV_DONTNEED only drops
+                            # the calling process's page-table entries for such a mapping; the
+                            # underlying tmpfs pages are NOT freed (they stay resident / in
+                            # swap). MADV_REMOVE punches a hole in the backing tmpfs file,
+                            # which actually frees the physical pages. We try MADV_REMOVE
+                            # first and fall back to MADV_DONTNEED on filesystems that don't
+                            # support hole-punching. Pages re-fault from the (now zeroed)
+                            # backing store on next write, at no cost.
+                            if current_daytime:
+                                try:
+                                    released_bytes = 0
+                                    for arr in (self.array1, self.array2):
+                                        ok, err = madviseArray(arr, MADV_REMOVE)
+                                        if not ok:
+                                            # MADV_REMOVE unsupported here (e.g. EOPNOTSUPP);
+                                            # fall back to dropping our page-table entries.
+                                            ok, err = madviseArray(arr, MADV_DONTNEED)
+                                        if ok:
+                                            released_bytes += arr.nbytes
+                                        else:
+                                            log.warning("Could not release a compression frame "
+                                                        "buffer (errno {})".format(err))
+
+                                    # Only claim success for buffers actually released, so the log
+                                    # never reports a release that silently failed (e.g. EINVAL).
+                                    if released_bytes:
+                                        log.info("Released compression frame buffers ({:.0f} MB) "
+                                                 "back to OS".format(released_bytes / (1024*1024)))
+                                except Exception as e:
+                                    log.warning("Could not release frame buffers: {}".format(e))
+
                             wait_for_reconnect = True
                             break
 
                         self.last_daytime_mode = current_daytime
 
                         # Calculate buffer fill percentage based on max frame age
-                        # The appsink has max-buffers=100, so at fps rate, max capacity is ~100/fps seconds
-                        max_buffer_time = 100.0 / self.config.fps  # Theoretical max buffer time in seconds
+                        # The appsink has max-buffers=gst_queue_size, so at fps rate, max
+                        # capacity is ~gst_queue_size/fps seconds
+                        max_buffer_time = float(self.config.gst_queue_size) / self.config.fps  # Theoretical max buffer time in seconds
                         buffer_fill_percent = min(100, (max_frame_age_seconds / max_buffer_time) * 100)
 
                         # Calculate dropped frames in last 10 minutes
