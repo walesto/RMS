@@ -1479,7 +1479,7 @@ class BufferedCapture(Process):
                     # Set the video device type
                     self.video_device_type = "gst"
 
-                    if self.night_data_dir is not None:
+                    if self.night_data_dir is not None and os.path.isdir(self.night_data_dir):
                         try:
                             addObsParam(getObservationSummaryDict(self.night_data_dir), "media_backend", "gst")
                         except Exception as e:
@@ -1504,7 +1504,7 @@ class BufferedCapture(Process):
                     # Note: video_device_type stays "cv2" - downstream logic (isOpened check,
                     # first-frame skipping) treats v4l2 as an OpenCV device. Only the recorded
                     # media_backend label is "v4l2".
-                    if self.night_data_dir is not None:
+                    if self.night_data_dir is not None and os.path.isdir(self.night_data_dir):
                         try:
                             addObsParam(getObservationSummaryDict(self.night_data_dir), "media_backend", "v4l2")
                         except Exception as e:
@@ -1523,7 +1523,7 @@ class BufferedCapture(Process):
                 log.info("Initialize OpenCV Device.")
                 self.device = cv2.VideoCapture(self.config.deviceID)
 
-                if self.night_data_dir is not None:
+                if self.night_data_dir is not None and os.path.isdir(self.night_data_dir):
                     try:
                         addObsParam(getObservationSummaryDict(self.night_data_dir), "media_backend", "cv2")
                     except Exception as e:
