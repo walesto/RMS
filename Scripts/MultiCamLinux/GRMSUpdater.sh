@@ -355,6 +355,40 @@ restart_stations() {
     done
 }
 
+# ------------------------------------------------------------
+#  usage() – print help and exit
+# ------------------------------------------------------------
+usage() {
+    cat <<'EOF'
+Usage: GRMSUpdater.sh [options]
+
+Stops running RMS stations, updates RMS, then restarts them. With no
+positional argument all configured stations (in ~/source/Stations) are
+restarted; with any positional argument only the previously-running
+stations are restarted.
+
+Options:
+  --term <terminal>   Terminal to launch stations in (default: lxterminal).
+                      One of: lxterminal, kitty, foot, footclient,
+                      gnome-terminal, tmux.
+  --profile <name>    gnome-terminal profile to launch with. Ignored by
+                      other terminals; gnome-terminal falls back to its
+                      default profile if <name> does not exist.
+  --force             Restart stations even if RMS is already up to date.
+  --reboot            Always reboot after updating.
+  --reboot-if-needed  Reboot only when one is pending (e.g. kernel update).
+  -h, --help          Show this help and exit.
+EOF
+}
+
+# Handle help before acquiring the lock or touching anything, so it works
+# even when another instance is running.
+for _arg in "$@"; do
+    case "$_arg" in
+        -h|--help) usage; exit 0 ;;
+    esac
+done
+
 # Log script start
 log_message "GRMSUpdater.sh started with args: $*"
 
@@ -398,6 +432,15 @@ while [[ $# -gt 0 ]]; do
         --reboot)
             REBOOT_MODE="always"
             shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --*)
+            log_message "Error: unknown option '$1'"
+            usage >&2
+            exit 1
             ;;
         *)
             POSITIONAL_ARGS+=("$1")
