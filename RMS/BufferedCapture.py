@@ -1099,8 +1099,8 @@ class BufferedCapture(Process):
         # Define the source up to the point where we want to branch off
         source_to_tee = (
             # udp-buffer-size: per-socket RTP receive buffer. rtspsrc defaults to
-            # 512KB, which can overflows during bitrate bursts and shows
-            # up as net UDP RcvbufErrors -> dropped frames. The configured size
+            # 512KB, which can overflow during bitrate bursts and shows
+            # up as UDP RcvbufErrors -> dropped frames. The configured size
             # (default 16MB) gives bursts room.
             # NOTE: net.core.rmem_max must be >= this value (see Scripts/UpdateBuffers.sh)
             # or the kernel clamps it back. Only affects the UDP transport path.

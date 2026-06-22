@@ -6,12 +6,12 @@
 # Usage: sudo ./Scripts/UpdateBuffers.sh
 #
 # This script checks and optionally updates UDP buffer sizes to handle
-# GStreamer's UDP source requirements (512KB per camera). Default Linux
-# settings are often too small, causing GStreamer warnings.
+# GStreamer's UDP source requirements (rtspsrc udp-buffer-size, default 16MB).
+# Default Linux settings are often too small, causing dropped frames.
 #
 # The script will:
 # - Show current buffer sizes
-# - Warn if below recommended values (512KB min, 1MB recommended)
+# - Warn if below recommended values (1MB min, 16MB recommended)
 # - Create backup of original settings
 # - Update settings if confirmed
 # - Show before/after comparison
@@ -51,11 +51,11 @@ show_settings() {
     # Check if buffers are below recommended size
     local update_needed=false
     if [ $current_rmem_max -lt $MIN_RECOMMENDED ] || [ $current_wmem_max -lt $MIN_RECOMMENDED ]; then
-        echo -e "WARNING: Current buffer sizes are below the minimum recommended size (512KB)"
+        echo -e "WARNING: Current buffer sizes are below the minimum recommended size ($(human_readable $MIN_RECOMMENDED))"
         echo "This may cause issues with GStreamer UDP buffer allocation."
         update_needed=true
     elif [ $current_rmem_max -lt $RECOMMENDED_SIZE ] || [ $current_wmem_max -lt $RECOMMENDED_SIZE ]; then
-        echo -e "NOTE: Current buffer sizes are below the recommended size (1MB)"
+        echo -e "NOTE: Current buffer sizes are below the recommended size ($(human_readable $RECOMMENDED_SIZE))"
         echo "Increasing them would provide more headroom for UDP operations."
         update_needed=true
     fi
@@ -97,7 +97,7 @@ echo "Creating sysctl drop-in file: $SYSCTL_DROP_IN"
 cat > "$SYSCTL_DROP_IN" << EOF
 # RMS UDP Buffer Configuration
 # Created by UpdateBuffers.sh on $(date)
-# Required for GStreamer UDP streaming (512KB min per camera)
+# Required for GStreamer UDP streaming (rtspsrc udp-buffer-size, default 16MB)
 
 net.core.rmem_max=$RECOMMENDED_SIZE
 net.core.wmem_max=$RECOMMENDED_SIZE
