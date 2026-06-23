@@ -5,6 +5,7 @@ from __future__ import print_function, division, absolute_import
 import os
 import zlib
 import sys
+import tempfile
 
 # Import the requests library for downloading the GMN star catalog
 try:
@@ -86,14 +87,23 @@ def removeFileSilently(path):
 def downloadCatalog(url, dir_path, file_name):
     """ Download a catalog file from a given URL and save it to the specified directory.
 
-    The file is first written to a temporary ".part" file in the same directory and only moved
-    into its final location once the download has completed (and, when the server reports a
+    The file is first written to a unique temporary ".part" file in the same directory and only
+    moved into its final location once the download has completed (and, when the server reports a
     Content-Length, once the full size has been received). This guarantees that an interrupted
-    download can never leave a partial/corrupt catalog at the destination path.
+    download can never leave a partial/corrupt catalog at the destination path. The temp name is
+    made unique (via tempfile.mkstemp) so concurrent processes downloading the same catalog do not
+    clobber each other's temp file.
+
+    Note: if the server reports no Content-Length and closes the connection cleanly but early, the
+    truncation cannot be detected here (there is no expected size to check against).
     """
 
     dest_path = os.path.join(dir_path, file_name)
-    tmp_path = dest_path + ".part"
+
+    # Create a unique temp file in the same directory (so os.replace stays atomic on one filesystem).
+    # Close the descriptor immediately and reopen by path below, so an early failure cannot leak the fd.
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix=file_name + ".", suffix=".part", dir=dir_path)
+    os.close(tmp_fd)
 
     try:
         response = urlopen(url)
