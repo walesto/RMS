@@ -289,6 +289,12 @@ class Config:
         # Transport Layer Protocol: tcp or udp
         self.protocol = "tcp"
 
+        # Per-socket UDP receive buffer size in bytes for the rtspsrc element (gst
+        # backend). Larger values give RTP bursts more room and prevent UDP
+        # RcvbufErrors -> dropped frames. Requires net.core.rmem_max >= this value
+        # (see Scripts/UpdateBuffers.sh) or the kernel clamps it back.
+        self.udp_buffer_size = 16777216
+
         # Media backend to use for capture. Options are gst, cv2, or v4l2
         self.media_backend = "gst"
 
@@ -1155,7 +1161,10 @@ def parseCapture(config, parser):
 
     if parser.has_option(section, "protocol"):
         config.protocol = parser.get(section, "protocol")
-    
+
+    if parser.has_option(section, "udp_buffer_size"):
+        config.udp_buffer_size = parser.getint(section, "udp_buffer_size")
+
     if parser.has_option(section, "media_backend"):
         config.media_backend = parser.get(section, "media_backend")
 
