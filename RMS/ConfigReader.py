@@ -1103,8 +1103,9 @@ def parseCapture(config, parser):
         config.video_scale_height = parser.getint(section, "video_scale_height")
 
     if parser.has_option(section, "video_crop"):
-        config.video_crop = parser.get(section, "video_crop")
-        if config.video_crop.lower() == "none":
+        config.video_crop = parser.get(section, "video_crop").strip()
+        # Treat an empty value or the literal "none" as disabled
+        if config.video_crop == "" or config.video_crop.lower() == "none":
             config.video_crop = None
 
 
