@@ -1446,20 +1446,16 @@ class BufferedCapture(Process):
                     width = getStructureValue(structure, 'width')
                     height = getStructureValue(structure, 'height')
 
-                    # When video_scale/video_crop are active, the decoded frame size is what
+                    # Based on camera settings and optional video_scale/video_crop parameters, the decoded frame size is what
                     # gets written into the fixed-size capture arrays (sized to config
                     # width/height). Warn if they disagree: a smaller frame is silently
-                    # zero-padded into the top-left of the array, while a larger one overflows
-                    # and aborts the capture block. (ROI is applied separately and may
+                    # zero-padded into the top-left of the array, while a larger one may cause overflows
+                    # and may abort the capture block. (ROI is applied separately and may
                     # legitimately shrink the frame further, so only warn, never abort.)
-                    scale_or_crop_active = (self.config.video_scale_width is not None
-                                            or self.config.video_scale_height is not None
-                                            or self.config.video_crop is not None)
-                    if scale_or_crop_active and (width != self.config.width
-                                                 or height != self.config.height):
-                        log.warning("video_scale/video_crop output is {:d}x{:d} but config "
+                    if width != self.config.width or height != self.config.height:
+                        log.warning("video output is {:d}x{:d} but config "
                                     "width/height is {:d}x{:d}; set width/height to match the "
-                                    "scaled+cropped size (smaller frames are zero-padded, larger "
+                                    "source video/scaled+cropped size (smaller frames are zero-padded, larger "
                                     "ones abort capture)".format(width, height,
                                                                  self.config.width, self.config.height))
 
